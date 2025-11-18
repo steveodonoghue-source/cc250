@@ -29,8 +29,7 @@ from autogen_agentchat.teams import SelectorGroupChat
 from autogen_agentchat.messages import (
     ChatMessage,
     TextMessage,
-    ToolCallMessage,
-    ToolCallResultMessage,
+    ToolCallSummaryMessage,
 )
 from autogen_core.models import ChatCompletionClient
 from autogen_core.tools import FunctionTool
@@ -1249,7 +1248,7 @@ class StreamlitAssistantAgent(AssistantAgent):
                 content=content,
                 agent=self.agent_name
             )
-        elif isinstance(response, ToolCallMessage):
+        elif isinstance(response, ToolCallSummaryMessage):
             tool_calls_display = []
             for tc in response.content:
                 tool_name = tc.name
