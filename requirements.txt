@@ -7,9 +7,13 @@ google-generativeai==0.8.5
 # Streamlit UI Framework
 streamlit>=1.31.0
 
-# Async support (included in Python 3.11+, but listed for completeness)
-# asyncio is part of standard library
+# Data Validation and Structured Outputs
+pydantic>=2.10.0
 
-# Additional utilities
-python-dotenv>=1.0.0
-pydantic>=2.10.0  # For structured outputs
+# Tool Dependencies
+requests>=2.31.0  # For web_search tool
+matplotlib>=3.8.0  # For create_visualization tool
+pillow>=10.0.0  # For analyze_image tool (PIL)
+
+# Utilities
+python-dotenv>=1.0.0  # For environment variable management
