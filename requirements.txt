@@ -15,5 +15,9 @@ requests>=2.31.0  # For web_search tool
 matplotlib>=3.8.0  # For create_visualization tool
 pillow>=10.0.0  # For analyze_image tool (PIL)
 
+# Distributed Execution (Redis Queue)
+redis>=5.0.0  # Redis client for RQ
+rq>=1.15.0  # Redis Queue for distributed code execution
+
 # Utilities
 python-dotenv>=1.0.0  # For environment variable management
