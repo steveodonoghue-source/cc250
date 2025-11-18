@@ -1,0 +1,14 @@
+# AutoGen and AI Libraries (already installed)
+autogen-agentchat==0.7.5
+autogen-core==0.7.5
+autogen-ext[openai]==0.7.5
+google-generativeai==0.8.5
+
+# Streamlit UI Framework
+streamlit>=1.31.0
+
+# Async support (included in Python 3.11+, but listed for completeness)
+# asyncio is part of standard library
+
+# Additional utilities
+python-dotenv>=1.0.0
