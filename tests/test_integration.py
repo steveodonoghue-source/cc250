@@ -170,7 +170,7 @@ class TestToolCallFlow:
 
             # Assert: Document ingested
             assert "✅" in ingest_result
-            assert "Ingested" in ingest_result
+            assert "ingested" in ingest_result.lower()
             mock_chroma_collection.add.assert_called_once()
 
             # Act: Query knowledge

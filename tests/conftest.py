@@ -65,30 +65,48 @@ def mock_gemini_client():
         last_message = messages[-1] if messages else ""
         content = last_message.get("content", "") if isinstance(last_message, dict) else str(last_message)
 
-        # Deterministic responses based on message content
-        if "plan" in content.lower():
-            response_content = json.dumps({
-                "task_summary": "Test Task",
-                "requirements": ["Requirement 1", "Requirement 2"],
-                "steps": [
-                    {"step_number": 1, "description": "Step 1", "estimated_complexity": "Low", "dependencies": []},
-                    {"step_number": 2, "description": "Step 2", "estimated_complexity": "Medium", "dependencies": [1]}
-                ],
-                "estimated_time": "30 minutes",
-                "technologies": ["Python"],
-                "risks": ["None identified"]
-            })
-        elif "review" in content.lower():
+        # Deterministic responses based on message content (order matters!)
+        if "review" in content.lower():
             response_content = json.dumps({
                 "overall_quality": "Good",
-                "strengths": ["Clean code", "Well documented"],
-                "issues": [],
+                "strengths": ["Uses regex", "Type hints"],
+                "issues": ["Missing docstring"],
                 "security_concerns": [],
                 "approved": True,
-                "feedback_summary": "Code looks good"
+                "feedback_summary": "Code is good but needs documentation"
             })
-        elif "code" in content.lower():
-            response_content = "def test_function():\n    return 'Hello, World!'"
+        elif "plan" in content.lower() or "email" in content.lower() or "validator" in content.lower():
+            response_content = json.dumps({
+                "task_summary": "Create email validator",
+                "requirements": ["Python 3.11", "regex support"],
+                "steps": [
+                    {"step_number": 1, "description": "Import re module", "estimated_complexity": "Low", "dependencies": []},
+                    {"step_number": 2, "description": "Write validation function", "estimated_complexity": "Medium", "dependencies": [1]}
+                ],
+                "estimated_time": "20 minutes",
+                "technologies": ["Python"],
+                "risks": ["Edge cases in email format"]
+            })
+        elif "skill" in content.lower() or "tool" in content.lower() or "factorial" in content.lower() or "calculate" in content.lower() or "create" in content.lower():
+            # Return skill definition for tool generation requests
+            if "factorial" in content.lower():
+                response_content = json.dumps({
+                    "tool_name": "tool_calculate_factorial",
+                    "description": "Calculate factorial of a number",
+                    "parameters": {"n": "int"},
+                    "code": "def tool_calculate_factorial(n: int) -> int:\n    if n <= 1:\n        return 1\n    return n * tool_calculate_factorial(n-1)",
+                    "safety_notes": ["No recursion to avoid stack overflow"]
+                })
+            else:
+                response_content = json.dumps({
+                    "tool_name": "tool_parse_csv",
+                    "description": "Parse CSV file and return data",
+                    "parameters": {"file_path": "str"},
+                    "code": "def tool_parse_csv(file_path: str) -> str:\n    import csv\n    with open(file_path) as f:\n        return str(list(csv.reader(f)))",
+                    "safety_notes": ["File must exist"]
+                })
+        elif "implement" in content.lower() or "code" in content.lower():
+            response_content = "def validate_email(email: str) -> bool:\n    import re\n    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$'\n    return bool(re.match(pattern, email))"
         else:
             response_content = "Test response from mocked Gemini"
 
