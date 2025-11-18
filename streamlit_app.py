@@ -67,6 +67,40 @@ except ImportError:
     Queue = None
     Job = None
 
+# ChromaDB and RAG imports
+try:
+    import chromadb
+    from chromadb.config import Settings
+    from sentence_transformers import SentenceTransformer
+    chromadb_available = True
+except ImportError:
+    chromadb_available = False
+    chromadb = None
+    Settings = None
+    SentenceTransformer = None
+
+# Document processing imports
+try:
+    from PyPDF2 import PdfReader
+    pdf_available = True
+except ImportError:
+    pdf_available = False
+    PdfReader = None
+
+try:
+    from docx import Document as DocxDocument
+    docx_available = True
+except ImportError:
+    docx_available = False
+    DocxDocument = None
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    text_splitter_available = True
+except ImportError:
+    text_splitter_available = False
+    RecursiveCharacterTextSplitter = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -95,6 +129,58 @@ PRICING = {
 }
 
 COST_ALERT_THRESHOLD = 1.00  # Alert when cost exceeds $1.00
+
+# ============================================================================
+# ChromaDB Configuration and Initialization
+# ============================================================================
+
+CHROMA_PERSIST_DIR = "./chroma_db"  # Directory for persistent storage
+CHROMA_COLLECTION_NAME = "default_knowledge"  # Default collection name
+
+def get_chroma_client():
+    """Initialize and return ChromaDB client with persistence."""
+    if not chromadb_available:
+        logger.warning("ChromaDB not available")
+        return None
+
+    try:
+        client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        logger.info(f"ChromaDB client initialized with persistence at {CHROMA_PERSIST_DIR}")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {e}")
+        return None
+
+def get_chroma_collection(client, collection_name: str = CHROMA_COLLECTION_NAME):
+    """Get or create a ChromaDB collection."""
+    if not client:
+        return None
+
+    try:
+        # Get or create collection
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={"description": "Long-term knowledge base for agents"}
+        )
+        logger.info(f"ChromaDB collection '{collection_name}' ready with {collection.count()} documents")
+        return collection
+    except Exception as e:
+        logger.error(f"Failed to get/create collection: {e}")
+        return None
+
+def get_embedding_model():
+    """Initialize and return sentence transformer model for embeddings."""
+    if not chromadb_available or not SentenceTransformer:
+        return None
+
+    try:
+        # Use a lightweight but effective model
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        logger.info("Embedding model loaded: all-MiniLM-L6-v2")
+        return model
+    except Exception as e:
+        logger.error(f"Failed to load embedding model: {e}")
+        return None
 
 # ============================================================================
 # Pydantic Schemas for Structured Outputs
@@ -162,6 +248,16 @@ class SkillDefinition(BaseModel):
     parameters: Dict[str, str] = Field(..., description="Parameter names and types")
     code: str = Field(..., description="Complete Python function code")
     safety_notes: List[str] = Field(default_factory=list, description="Security considerations")
+
+
+class TestComparison(BaseModel):
+    """Comparison result between baseline and new test run."""
+    coherence_score: int = Field(..., description="Coherence score from 1-10", ge=1, le=10)
+    differences_found: List[str] = Field(default_factory=list, description="List of differences identified")
+    improvements: List[str] = Field(default_factory=list, description="Improvements over baseline")
+    regressions: List[str] = Field(default_factory=list, description="Regressions from baseline")
+    critique: str = Field(..., description="Natural language critique and analysis")
+    recommendation: str = Field(..., description="Accept or Reject recommendation")
 
 
 # ============================================================================
@@ -387,7 +483,14 @@ def poll_job_result(job_id: str, timeout: int = 30) -> Dict[str, Any]:
 # ============================================================================
 
 def tool_web_search(query: str) -> str:
-    """Tool #1: Web search (RAG capability)."""
+    """
+    Tool #1: Hybrid Web Search and RAG (ChromaDB + Web).
+
+    NEW BEHAVIOR:
+    - First queries ChromaDB for internal knowledge
+    - If insufficient, performs external web search
+    - Combines both results for comprehensive retrieval
+    """
     logger.info(f"🔍 Tool called: web_search('{query}')")
 
     if "tool_calls" not in st.session_state:
@@ -399,29 +502,63 @@ def tool_web_search(query: str) -> str:
         "timestamp": datetime.now().isoformat()
     })
 
-    result = f"""
-    🔍 Web Search Results for: "{query}"
+    results = []
+    internal_results = []
 
-    [Simulated Results - Configure real search API for production]
+    # 1. INTERNAL KNOWLEDGE RETRIEVAL (ChromaDB)
+    try:
+        if chromadb_available and "chroma_client" in st.session_state:
+            client = st.session_state.chroma_client
+            collection = get_chroma_collection(client)
 
-    Top Results:
-    1. Official Documentation - Latest best practices and API references
-    2. Stack Overflow - Community solutions and common patterns
-    3. GitHub Repositories - Implementation examples and code samples
-    4. Recent Blog Posts - Current trends and recommendations
+            if collection and collection.count() > 0:
+                # Query ChromaDB with embedding
+                embedding_model = st.session_state.get("embedding_model")
+                if embedding_model:
+                    query_embedding = embedding_model.encode([query])[0].tolist()
 
-    Suggested Next Steps:
-    - Verify information against official documentation
-    - Check for recent security advisories
-    - Review community consensus on best practices
+                    chroma_results = collection.query(
+                        query_embeddings=[query_embedding],
+                        n_results=min(5, collection.count())
+                    )
 
-    To enable real search, configure one of:
-    - Google Custom Search: https://programmablesearchengine.google.com/
-    - Serper API: https://serper.dev
-    - Tavily: https://tavily.com
-    """
+                    if chroma_results and chroma_results['documents']:
+                        internal_results = chroma_results['documents'][0]
+                        logger.info(f"Found {len(internal_results)} internal knowledge results")
+    except Exception as e:
+        logger.error(f"ChromaDB query error: {e}")
 
-    return result
+    # Build result string
+    result_parts = [f"🔍 Hybrid Search Results for: \"{query}\"\n"]
+
+    # Add internal results if found
+    if internal_results:
+        result_parts.append("\n📚 INTERNAL KNOWLEDGE BASE:\n")
+        for idx, doc in enumerate(internal_results, 1):
+            # Truncate long documents
+            doc_preview = doc[:200] + "..." if len(doc) > 200 else doc
+            result_parts.append(f"{idx}. {doc_preview}\n")
+        result_parts.append("\n")
+
+    # 2. EXTERNAL WEB SEARCH (if needed)
+    if len(internal_results) < 3:
+        result_parts.append("🌐 EXTERNAL WEB SEARCH:\n")
+        result_parts.append("[Simulated - Configure real search API for production]\n\n")
+        result_parts.append("Top External Results:\n")
+        result_parts.append("1. Official Documentation - Latest best practices and API references\n")
+        result_parts.append("2. Stack Overflow - Community solutions and common patterns\n")
+        result_parts.append("3. GitHub Repositories - Implementation examples\n")
+        result_parts.append("4. Recent Blog Posts - Current trends and recommendations\n\n")
+
+    # Add recommendations
+    result_parts.append("💡 RECOMMENDATIONS:\n")
+    if internal_results:
+        result_parts.append("✓ Found relevant internal knowledge - prioritize these sources\n")
+    result_parts.append("- Verify information against official documentation\n")
+    result_parts.append("- Cross-reference with multiple sources\n")
+    result_parts.append("- Check for recent updates and security advisories\n")
+
+    return "".join(result_parts)
 
 
 def tool_execute_code(code: str, language: str = "python") -> str:
@@ -885,6 +1022,136 @@ def tool_validate_json(json_data: str, schema_name: str = "TaskPlan") -> str:
         return f"❌ Validation error: {str(e)}"
 
 
+def tool_ingest_document(file_path: str, collection_name: str = "default_knowledge") -> str:
+    """
+    Tool #12: Ingest document into ChromaDB for long-term knowledge.
+
+    NEW TOOL for Vector Database RAG:
+    - Reads document (txt, md, py, pdf, docx)
+    - Chunks text into manageable pieces
+    - Generates embeddings
+    - Stores in ChromaDB collection
+
+    Args:
+        file_path: Path to document file
+        collection_name: ChromaDB collection name (default: "default_knowledge")
+
+    Returns:
+        Success message with chunk count
+    """
+    logger.info(f"📥 Tool called: ingest_document('{file_path}', collection='{collection_name}')")
+
+    if "tool_calls" not in st.session_state:
+        st.session_state.tool_calls = []
+
+    st.session_state.tool_calls.append({
+        "tool": "ingest_document",
+        "file_path": file_path,
+        "collection": collection_name,
+        "timestamp": datetime.now().isoformat()
+    })
+
+    if not chromadb_available:
+        return "❌ ChromaDB not available. Install chromadb and sentence-transformers."
+
+    try:
+        # Read document content
+        path = Path(file_path)
+        if not path.exists():
+            return f"❌ File not found: {file_path}"
+
+        content = ""
+        file_ext = path.suffix.lower()
+
+        # Text-based files
+        if file_ext in ['.txt', '.md', '.py', '.json', '.yaml', '.yml', '.sh', '.bash']:
+            content = path.read_text(encoding='utf-8')
+        # PDF files
+        elif file_ext == '.pdf':
+            if not pdf_available:
+                return "❌ PDF support not available. Install PyPDF2."
+            pdf_reader = PdfReader(str(path))
+            content = "\n\n".join([page.extract_text() for page in pdf_reader.pages])
+        # DOCX files
+        elif file_ext == '.docx':
+            if not docx_available:
+                return "❌ DOCX support not available. Install python-docx."
+            doc = DocxDocument(str(path))
+            content = "\n\n".join([paragraph.text for paragraph in doc.paragraphs])
+        else:
+            return f"❌ Unsupported file type: {file_ext}. Supported: txt, md, py, pdf, docx"
+
+        if not content.strip():
+            return f"❌ No content extracted from {file_path}"
+
+        # Chunk the text
+        if text_splitter_available and RecursiveCharacterTextSplitter:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=50,
+                length_function=len
+            )
+            chunks = splitter.split_text(content)
+        else:
+            # Simple chunking if langchain not available
+            chunk_size = 500
+            chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
+
+        # Get ChromaDB client and collection
+        client = st.session_state.get("chroma_client")
+        if not client:
+            client = get_chroma_client()
+            if client:
+                st.session_state.chroma_client = client
+
+        if not client:
+            return "❌ Failed to initialize ChromaDB client"
+
+        collection = get_chroma_collection(client, collection_name)
+        if not collection:
+            return f"❌ Failed to get/create collection: {collection_name}"
+
+        # Generate embeddings and store
+        embedding_model = st.session_state.get("embedding_model")
+        if not embedding_model:
+            embedding_model = get_embedding_model()
+            if embedding_model:
+                st.session_state.embedding_model = embedding_model
+
+        if not embedding_model:
+            return "❌ Failed to load embedding model"
+
+        # Add chunks to collection
+        chunk_ids = [f"{path.stem}_chunk_{i}" for i in range(len(chunks))]
+        embeddings = embedding_model.encode(chunks).tolist()
+
+        collection.add(
+            documents=chunks,
+            embeddings=embeddings,
+            ids=chunk_ids,
+            metadatas=[{
+                "source": file_path,
+                "chunk_index": i,
+                "total_chunks": len(chunks)
+            } for i in range(len(chunks))]
+        )
+
+        logger.info(f"Ingested {len(chunks)} chunks from {file_path}")
+
+        return f"""✅ Document ingested successfully!
+
+File: {file_path}
+Chunks: {len(chunks)}
+Collection: {collection_name}
+Total documents in collection: {collection.count()}
+
+The knowledge is now available for hybrid search via tool_web_search."""
+
+    except Exception as e:
+        logger.error(f"Document ingestion error: {e}")
+        return f"❌ Ingestion failed: {str(e)}"
+
+
 # ============================================================================
 # LLM Configuration with Cost Tracking
 # ============================================================================
@@ -1339,38 +1606,115 @@ After generating, validate with tool_validate_json and hand off to Reviewer."""
     )
 
 
+def create_testing_agent() -> StreamlitAssistantAgent:
+    """
+    Create Testing agent for regression testing and comparison.
+
+    NEW AGENT: Compares test outputs against baselines and provides quality scores.
+    """
+    system_message = """You are an expert Testing agent specialized in regression testing and output comparison.
+
+Your unique role:
+1. Compare current agent outputs against saved baselines
+2. Analyze differences, improvements, and regressions
+3. Provide coherence scores (1-10) for output quality
+4. Generate natural language critiques of discrepancies
+5. Recommend Accept or Reject based on analysis
+6. Output TestComparison schema with structured results
+
+**Comparison Guidelines:**
+
+Scoring Criteria (1-10):
+- 10: Perfect match or significant improvement
+- 8-9: Minor improvements, no regressions
+- 6-7: Equivalent quality, minor differences
+- 4-5: Some regressions but acceptable
+- 1-3: Major regressions, unacceptable quality
+
+Focus Areas:
+- Correctness: Does the output solve the problem?
+- Completeness: Are all requirements addressed?
+- Code quality: Best practices, security, readability
+- Documentation: Clear comments and explanations
+- Edge cases: Proper handling of corner cases
+
+When comparing outputs:
+1. Extract key elements (code, explanations, structure)
+2. Identify functional differences vs. stylistic changes
+3. Assess impact of changes (positive/negative)
+4. Consider context: improvements may justify differences
+5. Be objective: flag real issues, ignore cosmetic changes
+
+**Output Format:**
+Always structure your analysis using the TestComparison schema:
+{
+  "coherence_score": 8,
+  "differences_found": ["list of differences"],
+  "improvements": ["list of improvements over baseline"],
+  "regressions": ["list of regressions from baseline"],
+  "critique": "detailed natural language analysis",
+  "recommendation": "Accept" or "Reject"
+}
+
+Remember: Minor differences are acceptable if quality is maintained or improved.
+Major regressions (security issues, incorrect logic, missing functionality) should result in rejection.
+"""
+
+    model_client = get_gemini_client("gemini-2.5-pro", agent_name="Testing")
+
+    # Testing agent has minimal tools - focus on analysis
+    tools = [
+        FunctionTool(tool_validate_json, description="Validate JSON against schemas")
+    ]
+
+    return StreamlitAssistantAgent(
+        name="Testing",
+        model_client=model_client,
+        system_message=system_message,
+        tools=tools,
+        handoffs=["User"]  # Report results to user
+    )
+
+
 # ============================================================================
 # Team Setup
 # ============================================================================
 
 def create_team() -> SelectorGroupChat:
-    """Create SelectorGroupChat with 5 agents including SkillGenerator."""
-    logger.info("Creating 5-agent team with cost tracking and skill generation...")
+    """Create SelectorGroupChat with 6 agents including SkillGenerator and Testing."""
+    logger.info("Creating 6-agent team with RAG, cost tracking, skill generation, and testing...")
 
     planner = create_planner_agent()
     coder = create_coder_agent()
     reviewer = create_reviewer_agent()
     filehandler = create_filehandler_agent()
     skillgenerator = create_skill_generator_agent()
+    testing = create_testing_agent()
 
     # Use Gemini Pro for team selector
     selector_client = get_gemini_client("gemini-2.5-pro", agent_name="TeamSelector")
 
     team = SelectorGroupChat(
-        participants=[planner, coder, reviewer, filehandler, skillgenerator],
+        participants=[planner, coder, reviewer, filehandler, skillgenerator, testing],
         model_client=selector_client,
         termination_condition=lambda msg: (
             "APPROVED" in str(msg.content).upper() or
             "TERMINATE" in str(msg.content).upper() or
             (isinstance(msg, TextMessage) and '"approved": true' in msg.content.lower())
         ),
-        max_turns=35  # More turns for skill generation workflows
+        max_turns=40  # More turns for testing and skill generation workflows
     )
 
-    # Store FileHandler reference for potential skill registration
+    # Store references for special operations
     st.session_state.filehandler_agent = filehandler
+    st.session_state.testing_agent = testing
 
-    logger.info("Team created with 5 agents, cost tracking, and dynamic skill generation")
+    # Initialize ChromaDB and embedding model
+    if chromadb_available and "chroma_client" not in st.session_state:
+        st.session_state.chroma_client = get_chroma_client()
+        st.session_state.embedding_model = get_embedding_model()
+
+    logger.info("Team created with 6 agents, RAG, cost tracking, and regression testing")
     return team
 
 
@@ -1413,20 +1757,44 @@ def initialize_session_state():
     if "filehandler_agent" not in st.session_state:
         st.session_state.filehandler_agent = None
 
+    # New state for regression testing
+    if "baselines" not in st.session_state:
+        st.session_state.baselines = {}  # {name: {"prompt": str, "output": str, "messages": list}}
+
+    if "regression_mode" not in st.session_state:
+        st.session_state.regression_mode = False
+
+    if "current_baseline" not in st.session_state:
+        st.session_state.current_baseline = None
+
+    # New state for multimodal
+    if "uploaded_files" not in st.session_state:
+        st.session_state.uploaded_files = []
+
+    if "chroma_client" not in st.session_state:
+        st.session_state.chroma_client = None
+
+    if "embedding_model" not in st.session_state:
+        st.session_state.embedding_model = None
+
+    if "testing_agent" not in st.session_state:
+        st.session_state.testing_agent = None
+
 
 def render_sidebar():
-    """Render sidebar with configuration and cost monitoring."""
+    """Render sidebar with configuration, cost monitoring, and regression testing."""
     with st.sidebar:
         st.title("⚙️ Configuration")
 
         # Model info
-        st.markdown("### 🤖 Active Agents")
+        st.markdown("### 🤖 Active Agents (6)")
         st.markdown("""
         - **Planner**: `gemini-2.5-pro` 🧠
         - **Coder**: `gemini-2.5-flash` ⚡
         - **Reviewer**: `gemini-2.5-pro` 🔍
         - **FileHandler**: `gemini-2.5-flash` 📁
-        - **SkillGenerator**: `gemini-2.5-pro` 🧠 **NEW!**
+        - **SkillGenerator**: `gemini-2.5-pro` 🧠
+        - **Testing**: `gemini-2.5-pro` 🧪 **NEW!**
         """)
 
         st.divider()

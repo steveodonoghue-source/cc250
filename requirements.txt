@@ -19,5 +19,14 @@ pillow>=10.0.0  # For analyze_image tool (PIL)
 redis>=5.0.0  # Redis client for RQ
 rq>=1.15.0  # Redis Queue for distributed code execution
 
+# Vector Database and RAG (ChromaDB)
+chromadb>=0.4.22  # Vector database for long-term memory
+sentence-transformers>=2.2.2  # Embeddings for ChromaDB
+langchain-text-splitters>=0.0.1  # Text chunking for document ingestion
+
+# Document Processing (Multimodal)
+PyPDF2>=3.0.0  # PDF text extraction
+python-docx>=1.1.0  # DOCX text extraction
+
 # Utilities
 python-dotenv>=1.0.0  # For environment variable management
