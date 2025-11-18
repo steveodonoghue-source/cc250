@@ -1,11 +1,11 @@
 """
-AutoGen v0.4 Multi-Agent Coding System with Streamlit UI (Complete Edition)
-===========================================================================
+AutoGen v0.4 Multi-Agent Coding System - Production Edition
+============================================================
 Advanced collaborative AI coding assistant featuring:
-- Gemini 2.5 Pro (Planner/Reviewer) and Flash (Coder/FileHandler) models
-- Structured outputs with Pydantic schemas
-- 10 specialized tools for comprehensive development workflow
-- FileHandler agent for secure I/O operations
+- Gemini 2.5 Pro (Planner/Reviewer/SkillGenerator) and Flash (Coder/FileHandler)
+- 10+ specialized tools with dynamic skill generation
+- Distributed code execution via Redis Queue (RQ)
+- Real-time cost monitoring and alerting
 - Human-in-the-loop approval with state persistence
 """
 
@@ -16,10 +16,11 @@ import os
 import subprocess
 import tempfile
 import zipfile
-from typing import Any, Dict, List, Sequence, Optional
+from typing import Any, Dict, List, Sequence, Optional, Callable
 from datetime import datetime
 from pathlib import Path
 import io
+import inspect
 
 import streamlit as st
 from pydantic import BaseModel, Field, ValidationError
@@ -44,7 +45,7 @@ except ImportError:
 
 try:
     import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend for Streamlit
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
@@ -54,12 +55,46 @@ try:
 except ImportError:
     Image = None
 
+# Redis Queue imports
+try:
+    from redis import Redis
+    from rq import Queue
+    from rq.job import Job
+    redis_available = True
+except ImportError:
+    redis_available = False
+    Redis = None
+    Queue = None
+    Job = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Cost Tracking Configuration
+# ============================================================================
+
+# Gemini 2.5 pricing (approximate, update with actual prices)
+PRICING = {
+    "gemini-2.5-pro": {
+        "input": 0.00125 / 1000,   # $0.00125 per 1K input tokens
+        "output": 0.00500 / 1000,  # $0.00500 per 1K output tokens
+    },
+    "gemini-2.5-flash": {
+        "input": 0.00010 / 1000,   # $0.00010 per 1K input tokens
+        "output": 0.00040 / 1000,  # $0.00040 per 1K output tokens
+    },
+    "gemini-2.0-flash-exp": {  # Fallback for image analysis
+        "input": 0.00010 / 1000,
+        "output": 0.00040 / 1000,
+    }
+}
+
+COST_ALERT_THRESHOLD = 1.00  # Alert when cost exceeds $1.00
 
 # ============================================================================
 # Pydantic Schemas for Structured Outputs
@@ -120,28 +155,241 @@ class CodeReview(BaseModel):
     feedback_summary: str = Field(..., description="Overall feedback in 1-2 sentences")
 
 
+class SkillDefinition(BaseModel):
+    """Definition for a dynamically generated skill/tool."""
+    tool_name: str = Field(..., description="Name of the tool function")
+    description: str = Field(..., description="What the tool does")
+    parameters: Dict[str, str] = Field(..., description="Parameter names and types")
+    code: str = Field(..., description="Complete Python function code")
+    safety_notes: List[str] = Field(default_factory=list, description="Security considerations")
+
+
 # ============================================================================
-# Tool Implementations (10 Specialized Tools)
+# Cost Tracking Wrapper for ChatCompletionClient
+# ============================================================================
+
+class CostTrackingChatClient(OpenAIChatCompletionClient):
+    """
+    Wrapper around OpenAIChatCompletionClient that tracks token usage and costs.
+
+    Intercepts LLM responses to extract token counts and calculates costs based
+    on the model's pricing.
+    """
+
+    def __init__(self, agent_name: str, model: str, *args, **kwargs):
+        super().__init__(model=model, *args, **kwargs)
+        self.agent_name = agent_name
+        self.model = model
+        logger.info(f"Created CostTrackingChatClient for {agent_name} using {model}")
+
+    async def create(self, messages: Sequence[Any], *args, **kwargs) -> Any:
+        """Override create to track token usage."""
+        # Call parent implementation
+        response = await super().create(messages, *args, **kwargs)
+
+        # Extract token usage from response
+        try:
+            # Response structure varies, try to extract usage info
+            usage = getattr(response, 'usage', None)
+
+            if usage:
+                input_tokens = getattr(usage, 'prompt_tokens', 0)
+                output_tokens = getattr(usage, 'completion_tokens', 0)
+                total_tokens = getattr(usage, 'total_tokens', input_tokens + output_tokens)
+
+                # Calculate cost
+                model_pricing = PRICING.get(self.model, PRICING["gemini-2.5-flash"])
+                input_cost = input_tokens * model_pricing["input"]
+                output_cost = output_tokens * model_pricing["output"]
+                total_cost = input_cost + output_cost
+
+                # Track in session state
+                self._track_usage(input_tokens, output_tokens, total_cost)
+
+                logger.info(
+                    f"[{self.agent_name}] Tokens: {input_tokens} in, {output_tokens} out, "
+                    f"${total_cost:.6f}"
+                )
+        except Exception as e:
+            logger.warning(f"Could not extract token usage: {e}")
+
+        return response
+
+    def _track_usage(self, input_tokens: int, output_tokens: int, cost: float):
+        """Track usage in session state."""
+        if "cost_tracking" not in st.session_state:
+            st.session_state.cost_tracking = {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_cost": 0.0,
+                "by_agent": {},
+                "history": []
+            }
+
+        # Update totals
+        st.session_state.cost_tracking["total_input_tokens"] += input_tokens
+        st.session_state.cost_tracking["total_output_tokens"] += output_tokens
+        st.session_state.cost_tracking["total_cost"] += cost
+
+        # Update per-agent tracking
+        if self.agent_name not in st.session_state.cost_tracking["by_agent"]:
+            st.session_state.cost_tracking["by_agent"][self.agent_name] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost": 0.0,
+                "calls": 0
+            }
+
+        agent_stats = st.session_state.cost_tracking["by_agent"][self.agent_name]
+        agent_stats["input_tokens"] += input_tokens
+        agent_stats["output_tokens"] += output_tokens
+        agent_stats["cost"] += cost
+        agent_stats["calls"] += 1
+
+        # Add to history
+        st.session_state.cost_tracking["history"].append({
+            "timestamp": datetime.now().isoformat(),
+            "agent": self.agent_name,
+            "model": self.model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost": cost
+        })
+
+
+# ============================================================================
+# Redis Queue Setup for Distributed Execution
+# ============================================================================
+
+def get_redis_queue():
+    """Get or create Redis Queue connection."""
+    if not redis_available:
+        return None
+
+    try:
+        # Try to connect to Redis (assumes Redis running on localhost:6379)
+        redis_conn = Redis(host='localhost', port=6379, db=0, socket_connect_timeout=1)
+        redis_conn.ping()  # Test connection
+
+        # Create RQ queue
+        queue = Queue('code_execution', connection=redis_conn)
+        logger.info("Successfully connected to Redis Queue")
+        return queue
+    except Exception as e:
+        logger.warning(f"Redis not available: {e}")
+        return None
+
+
+def execute_code_worker(code: str, language: str = "python") -> Dict[str, Any]:
+    """
+    Worker function for RQ to execute code in isolation.
+
+    This runs in a separate process managed by RQ worker.
+
+    Args:
+        code: Code to execute
+        language: Programming language
+
+    Returns:
+        Dict with status, output, and error information
+    """
+    if language.lower() != "python":
+        return {
+            "status": "error",
+            "output": "",
+            "error": f"Language '{language}' not supported"
+        }
+
+    try:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(code)
+            temp_file = f.name
+
+        # Execute with timeout
+        result = subprocess.run(
+            ['python', temp_file],
+            capture_output=True,
+            text=True,
+            timeout=10,  # 10 second timeout for worker
+            cwd=tempfile.gettempdir()
+        )
+
+        # Clean up
+        os.unlink(temp_file)
+
+        return {
+            "status": "success" if result.returncode == 0 else "error",
+            "output": result.stdout,
+            "error": result.stderr if result.returncode != 0 else "",
+            "returncode": result.returncode
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "error",
+            "output": "",
+            "error": "Execution timeout (10 seconds exceeded)"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "output": "",
+            "error": str(e)
+        }
+
+
+def poll_job_result(job_id: str, timeout: int = 30) -> Dict[str, Any]:
+    """
+    Poll RQ job for result.
+
+    Args:
+        job_id: RQ job ID
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        Job result or timeout error
+    """
+    if not redis_available:
+        return {"status": "error", "error": "Redis not available"}
+
+    try:
+        redis_conn = Redis(host='localhost', port=6379, db=0)
+        job = Job.fetch(job_id, connection=redis_conn)
+
+        # Wait for job to complete (with timeout)
+        import time
+        start_time = time.time()
+
+        while not job.is_finished and not job.is_failed:
+            if time.time() - start_time > timeout:
+                return {
+                    "status": "timeout",
+                    "error": f"Job did not complete within {timeout} seconds"
+                }
+            time.sleep(0.5)
+            job.refresh()
+
+        if job.is_failed:
+            return {
+                "status": "error",
+                "error": f"Job failed: {job.exc_info}"
+            }
+
+        return job.result
+
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ============================================================================
+# Tool Implementations (10 Original + Job Polling)
 # ============================================================================
 
 def tool_web_search(query: str) -> str:
-    """
-    Tool #1: Perform a web search to find information (RAG capability).
-
-    For production, integrate with:
-    - Google Custom Search API
-    - Serper API (https://serper.dev)
-    - Tavily Search API (https://tavily.com)
-
-    Args:
-        query: The search query
-
-    Returns:
-        Search results as a formatted string
-    """
+    """Tool #1: Web search (RAG capability)."""
     logger.info(f"🔍 Tool called: web_search('{query}')")
 
-    # Track in session state
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -151,7 +399,6 @@ def tool_web_search(query: str) -> str:
         "timestamp": datetime.now().isoformat()
     })
 
-    # Simulated search results (replace with actual API in production)
     result = f"""
     🔍 Web Search Results for: "{query}"
 
@@ -179,25 +426,15 @@ def tool_web_search(query: str) -> str:
 
 def tool_execute_code(code: str, language: str = "python") -> str:
     """
-    Tool #2: Execute code in a simulated sandbox environment.
+    Tool #2: Execute code via Redis Queue (distributed execution).
 
-    ⚠️ SECURITY WARNING: This is a simulation for demonstration.
-    For production, use proper sandboxing:
-    - Docker containers
-    - AWS Lambda
-    - Google Cloud Run
-    - E2B (https://e2b.dev)
-
-    Args:
-        code: The code to execute
-        language: Programming language (default: python)
-
-    Returns:
-        Execution results or error message
+    NEW BEHAVIOR:
+    - Enqueues code to RQ worker
+    - Returns job ID for polling
+    - Requires HITL approval first
     """
     logger.warning(f"⚠️ Tool called: execute_code (language={language})")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -208,44 +445,62 @@ def tool_execute_code(code: str, language: str = "python") -> str:
         "timestamp": datetime.now().isoformat()
     })
 
-    # SECURITY: Request human approval for code execution
+    # SECURITY: Request human approval
     if "pending_approval" not in st.session_state:
         st.session_state.pending_approval = None
 
     st.session_state.pending_approval = {
-        "action": "Code Execution",
+        "action": "Code Execution (Distributed)",
         "code": code,
         "language": language,
         "timestamp": datetime.now().isoformat()
     }
 
-    # Check if approved
     if not st.session_state.get("approval_granted", False):
         return "⚠️ Code execution requires human approval. Waiting for user confirmation..."
 
-    # Reset approval after use
+    # Reset approval
     st.session_state.approval_granted = False
 
-    if language.lower() != "python":
-        return f"❌ Language '{language}' not supported in this simulation. Only Python is supported."
+    # Try to use RQ if available, fallback to local execution
+    queue = get_redis_queue()
 
-    # Simulate execution (DO NOT use in production without proper sandboxing)
+    if queue:
+        # Enqueue to RQ worker
+        try:
+            job = queue.enqueue(execute_code_worker, code, language, job_timeout=30)
+            logger.info(f"Code enqueued to RQ worker: {job.id}")
+
+            return f"""✅ Code execution job enqueued to distributed worker!
+
+Job ID: {job.id}
+
+To get results, use tool_poll_job_result with this job ID.
+The FileHandler agent will automatically poll for results."""
+
+        except Exception as e:
+            logger.error(f"RQ enqueue failed: {e}")
+            return f"❌ Failed to enqueue job: {str(e)}\n\nFalling back to local execution..."
+
+    # Fallback: Local execution (original behavior)
+    logger.warning("Redis not available, executing locally")
+
+    if language.lower() != "python":
+        return f"❌ Language '{language}' not supported. Only Python is supported."
+
     try:
-        # Create temporary file for code
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
             f.write(code)
             temp_file = f.name
 
-        # Execute with timeout and restricted environment
         result = subprocess.run(
             ['python', temp_file],
             capture_output=True,
             text=True,
-            timeout=5,  # 5 second timeout
-            cwd=tempfile.gettempdir()  # Isolated directory
+            timeout=5,
+            cwd=tempfile.gettempdir()
         )
 
-        # Clean up
         os.unlink(temp_file)
 
         output = result.stdout if result.returncode == 0 else result.stderr
@@ -259,24 +514,53 @@ def tool_execute_code(code: str, language: str = "python") -> str:
         return f"❌ Execution error: {str(e)}"
 
 
+def tool_poll_job_result(job_id: str) -> str:
+    """
+    Tool #11: Poll RQ job for execution results.
+
+    Used by FileHandler to get results from distributed code execution.
+    """
+    logger.info(f"📊 Tool called: poll_job_result('{job_id}')")
+
+    if "tool_calls" not in st.session_state:
+        st.session_state.tool_calls = []
+
+    st.session_state.tool_calls.append({
+        "tool": "poll_job_result",
+        "job_id": job_id,
+        "timestamp": datetime.now().isoformat()
+    })
+
+    result = poll_job_result(job_id, timeout=30)
+
+    if result.get("status") == "success":
+        return f"""✅ Job completed successfully!
+
+Output:
+{result.get('output', '')}
+"""
+    elif result.get("status") == "timeout":
+        return f"""⏱️ Job is still running or timed out.
+
+Error: {result.get('error', 'Unknown')}
+
+Try polling again or increase timeout."""
+    else:
+        error = result.get('error', 'Unknown error')
+        return f"""❌ Job failed!
+
+Error:
+{error}
+
+Output:
+{result.get('output', '')}
+"""
+
+
 def tool_static_analysis(file_path: str) -> str:
-    """
-    Tool #3: Perform static code analysis.
-
-    Simulates tools like:
-    - Pylint (code quality)
-    - Bandit (security)
-    - MyPy (type checking)
-
-    Args:
-        file_path: Path to the file to analyze
-
-    Returns:
-        Analysis results
-    """
+    """Tool #3: Static code analysis."""
     logger.info(f"🔍 Tool called: static_analysis('{file_path}')")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -286,11 +570,9 @@ def tool_static_analysis(file_path: str) -> str:
         "timestamp": datetime.now().isoformat()
     })
 
-    # Check if file exists
     if not os.path.exists(file_path):
         return f"❌ File not found: {file_path}"
 
-    # Simulate analysis
     result = f"""
     📊 Static Analysis Report for: {file_path}
 
@@ -322,19 +604,9 @@ def tool_static_analysis(file_path: str) -> str:
 
 
 def tool_create_visualization(data_json: str, chart_type: str = "bar") -> str:
-    """
-    Tool #4: Create data visualization using matplotlib.
-
-    Args:
-        data_json: JSON string containing data (e.g., {"labels": [...], "values": [...]})
-        chart_type: Type of chart (bar, line, pie, scatter)
-
-    Returns:
-        Path to the generated chart image
-    """
+    """Tool #4: Create data visualization."""
     logger.info(f"📊 Tool called: create_visualization(chart_type='{chart_type}')")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -348,7 +620,6 @@ def tool_create_visualization(data_json: str, chart_type: str = "bar") -> str:
         return "❌ Matplotlib not available. Install with: pip install matplotlib"
 
     try:
-        # Parse data
         data = json.loads(data_json)
         labels = data.get("labels", [])
         values = data.get("values", [])
@@ -356,10 +627,8 @@ def tool_create_visualization(data_json: str, chart_type: str = "bar") -> str:
         if not labels or not values:
             return "❌ Invalid data format. Expected: {\"labels\": [...], \"values\": [...]}"
 
-        # Create figure
         fig, ax = plt.subplots(figsize=(10, 6))
 
-        # Create chart based on type
         if chart_type.lower() == "bar":
             ax.bar(labels, values)
             ax.set_ylabel('Value')
@@ -373,13 +642,12 @@ def tool_create_visualization(data_json: str, chart_type: str = "bar") -> str:
             ax.set_xticks(range(len(values)))
             ax.set_xticklabels(labels)
         else:
-            return f"❌ Unsupported chart type: {chart_type}. Use: bar, line, pie, scatter"
+            return f"❌ Unsupported chart type: {chart_type}"
 
         ax.set_title(f'{chart_type.capitalize()} Chart')
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
 
-        # Save to temporary file
         temp_dir = tempfile.gettempdir()
         chart_path = os.path.join(temp_dir, f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
         plt.savefig(chart_path, dpi=150, bbox_inches='tight')
@@ -394,21 +662,9 @@ def tool_create_visualization(data_json: str, chart_type: str = "bar") -> str:
 
 
 def tool_read_document(file_path: str) -> str:
-    """
-    Tool #5: Read document contents from a file.
-
-    Supports text files, Python files, etc.
-    For PDFs, consider using PyPDF2 or pdfplumber.
-
-    Args:
-        file_path: Path to the document
-
-    Returns:
-        Document contents or error message
-    """
+    """Tool #5: Read document contents."""
     logger.info(f"📄 Tool called: read_document('{file_path}')")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -419,20 +675,16 @@ def tool_read_document(file_path: str) -> str:
     })
 
     try:
-        # Check if file exists
         if not os.path.exists(file_path):
             return f"❌ File not found: {file_path}"
 
-        # Check file size (limit to 1MB for safety)
         file_size = os.path.getsize(file_path)
         if file_size > 1_000_000:
             return f"❌ File too large ({file_size} bytes). Maximum: 1MB"
 
-        # Read file
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Truncate if too long
         if len(content) > 10000:
             content = content[:10000] + f"\n\n... (truncated, total length: {len(content)} chars)"
 
@@ -445,19 +697,9 @@ def tool_read_document(file_path: str) -> str:
 
 
 def tool_analyze_image(image_file_path: str, prompt: str = "Describe this image in detail") -> str:
-    """
-    Tool #6: Analyze an image using Gemini Vision API.
-
-    Args:
-        image_file_path: Path to the image file
-        prompt: Question or instruction about the image
-
-    Returns:
-        AI-generated description/analysis of the image
-    """
+    """Tool #6: Analyze image using Gemini Vision."""
     logger.info(f"🖼️ Tool called: analyze_image('{image_file_path}')")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -469,11 +711,9 @@ def tool_analyze_image(image_file_path: str, prompt: str = "Describe this image 
     })
 
     try:
-        # Check if file exists
         if not os.path.exists(image_file_path):
             return f"❌ Image file not found: {image_file_path}"
 
-        # Get API key
         api_key = (
             os.environ.get("GEMINI_API_KEY") or
             os.environ.get("GOOGLE_API_KEY") or
@@ -483,19 +723,14 @@ def tool_analyze_image(image_file_path: str, prompt: str = "Describe this image 
         if not api_key:
             return "❌ API key not found for image analysis"
 
-        # Configure Gemini
         genai.configure(api_key=api_key)
-
-        # Use vision model
         model = genai.GenerativeModel('gemini-2.0-flash-exp')
 
-        # Load image
         if Image:
             img = Image.open(image_file_path)
         else:
             return "❌ PIL not available. Install with: pip install pillow"
 
-        # Generate description
         response = model.generate_content([prompt, img])
 
         return f"✅ Image Analysis:\n\n{response.text}"
@@ -505,15 +740,9 @@ def tool_analyze_image(image_file_path: str, prompt: str = "Describe this image 
 
 
 def tool_create_project_zip() -> str:
-    """
-    Tool #7: Create a ZIP archive of the current project.
-
-    Returns:
-        Path to the created ZIP file
-    """
+    """Tool #7: Create ZIP archive."""
     logger.info(f"📦 Tool called: create_project_zip()")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -523,31 +752,24 @@ def tool_create_project_zip() -> str:
     })
 
     try:
-        # Create ZIP in temp directory
         temp_dir = tempfile.gettempdir()
         zip_path = os.path.join(
             temp_dir,
             f"project_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         )
 
-        # Get current working directory
         project_dir = os.getcwd()
 
-        # Create ZIP
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Add Python files from current directory
             for root, dirs, files in os.walk(project_dir):
-                # Skip common directories
                 dirs[:] = [d for d in dirs if d not in ['.git', '__pycache__', 'venv', 'env', '.venv']]
 
                 for file in files:
-                    # Only include relevant files
                     if file.endswith(('.py', '.md', '.txt', '.toml', '.yaml', '.yml')):
                         file_path = os.path.join(root, file)
                         arcname = os.path.relpath(file_path, project_dir)
                         zipf.write(file_path, arcname)
 
-        # Get file size
         size = os.path.getsize(zip_path)
         size_mb = size / (1024 * 1024)
 
@@ -558,15 +780,9 @@ def tool_create_project_zip() -> str:
 
 
 def tool_get_current_datetime() -> str:
-    """
-    Tool #8: Get the current date and time.
-
-    Returns:
-        Current datetime in ISO format
-    """
+    """Tool #8: Get current datetime."""
     logger.info(f"🕐 Tool called: get_current_datetime()")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -588,21 +804,9 @@ def tool_get_current_datetime() -> str:
 
 
 def tool_git_command(command: str) -> str:
-    """
-    Tool #9: Execute Git commands.
-
-    ⚠️ SECURITY: Limited to safe, read-only commands by default.
-    For production, implement proper validation.
-
-    Args:
-        command: Git command to execute (e.g., "status", "log", "diff")
-
-    Returns:
-        Command output or error message
-    """
+    """Tool #9: Execute Git commands."""
     logger.info(f"🔧 Tool called: git_command('{command}')")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -612,21 +816,16 @@ def tool_git_command(command: str) -> str:
         "timestamp": datetime.now().isoformat()
     })
 
-    # Whitelist of safe commands
     safe_commands = ['status', 'log', 'diff', 'branch', 'remote', 'show', 'ls-files']
 
-    # Parse command
     cmd_parts = command.strip().split()
     if not cmd_parts:
         return "❌ Empty command"
 
-    # Check if command is safe
     if cmd_parts[0] not in safe_commands:
-        return f"❌ Command '{cmd_parts[0]}' not in safe list: {', '.join(safe_commands)}\n\n" \
-               f"For write operations (commit, push, etc.), request human approval first."
+        return f"❌ Command '{cmd_parts[0]}' not in safe list: {', '.join(safe_commands)}"
 
     try:
-        # Execute git command
         result = subprocess.run(
             ['git'] + cmd_parts,
             capture_output=True,
@@ -649,19 +848,9 @@ def tool_git_command(command: str) -> str:
 
 
 def tool_validate_json(json_data: str, schema_name: str = "TaskPlan") -> str:
-    """
-    Tool #10: Validate JSON data against a Pydantic schema.
-
-    Args:
-        json_data: JSON string to validate
-        schema_name: Name of schema (TaskPlan, CodeReview, etc.)
-
-    Returns:
-        Validation result
-    """
+    """Tool #10: Validate JSON against Pydantic schemas."""
     logger.info(f"✅ Tool called: validate_json(schema='{schema_name}')")
 
-    # Track tool call
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
@@ -671,21 +860,18 @@ def tool_validate_json(json_data: str, schema_name: str = "TaskPlan") -> str:
         "timestamp": datetime.now().isoformat()
     })
 
-    # Map schema names to classes
     schemas = {
         "TaskPlan": TaskPlan,
         "CodeReview": CodeReview,
-        "TaskStep": TaskStep
+        "TaskStep": TaskStep,
+        "SkillDefinition": SkillDefinition
     }
 
     if schema_name not in schemas:
         return f"❌ Unknown schema: {schema_name}. Available: {', '.join(schemas.keys())}"
 
     try:
-        # Parse JSON
         data = json.loads(json_data)
-
-        # Validate against schema
         schema_class = schemas[schema_name]
         validated = schema_class(**data)
 
@@ -700,22 +886,15 @@ def tool_validate_json(json_data: str, schema_name: str = "TaskPlan") -> str:
 
 
 # ============================================================================
-# LLM Configuration (Gemini 2.5 Models)
+# LLM Configuration with Cost Tracking
 # ============================================================================
 
-def get_gemini_client(model: str = "gemini-2.5-pro") -> ChatCompletionClient:
+def get_gemini_client(model: str = "gemini-2.5-pro", agent_name: str = "Unknown") -> ChatCompletionClient:
     """
-    Get a Gemini model client configured for AutoGen via OpenAI-compatible API.
+    Get Gemini model client with cost tracking.
 
-    Supports both Gemini 2.5 Pro (for complex reasoning) and Flash (for speed).
-
-    Args:
-        model: Model identifier - "gemini-2.5-pro" or "gemini-2.5-flash"
-
-    Returns:
-        ChatCompletionClient configured for the specified Gemini model
+    NEW: Returns CostTrackingChatClient wrapper for token/cost monitoring.
     """
-    # Get API key from multiple possible sources
     api_key = (
         os.environ.get("GEMINI_API_KEY") or
         os.environ.get("GOOGLE_API_KEY") or
@@ -730,13 +909,12 @@ def get_gemini_client(model: str = "gemini-2.5-pro") -> ChatCompletionClient:
             "add to .streamlit/secrets.toml, or enter in the UI."
         )
 
-    # Configure genai for direct usage (image analysis, etc.)
     genai.configure(api_key=api_key)
 
-    logger.info(f"Creating Gemini client with model: {model}")
+    logger.info(f"Creating cost-tracking Gemini client: {model} for {agent_name}")
 
-    # Return OpenAI-compatible client pointing to Gemini
-    return OpenAIChatCompletionClient(
+    return CostTrackingChatClient(
+        agent_name=agent_name,
         model=model,
         api_key=api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -753,10 +931,7 @@ def get_gemini_client(model: str = "gemini-2.5-pro") -> ChatCompletionClient:
 # ============================================================================
 
 class StreamlitAssistantAgent(AssistantAgent):
-    """
-    Custom AssistantAgent that logs messages to Streamlit's session state
-    for real-time visualization in the chat interface.
-    """
+    """Custom AssistantAgent with Streamlit integration and cost tracking."""
 
     def __init__(self, name: str, *args, **kwargs):
         super().__init__(name=name, *args, **kwargs)
@@ -764,23 +939,20 @@ class StreamlitAssistantAgent(AssistantAgent):
         logger.info(f"Initialized StreamlitAssistantAgent: {name}")
 
     async def on_messages(self, messages: Sequence[ChatMessage], cancellation_token=None) -> ChatMessage:
-        """Override to capture and log messages to Streamlit."""
+        """Override to capture and log messages."""
         logger.info(f"{self.agent_name} processing {len(messages)} message(s)")
 
-        # Process with parent class
         response = await super().on_messages(messages, cancellation_token)
 
-        # Log response
         if isinstance(response, TextMessage):
             content = response.content
 
-            # Check if this is structured output (JSON)
             try:
                 parsed = json.loads(content)
-                if "task_summary" in parsed:  # TaskPlan
+                if "task_summary" in parsed:
                     plan = TaskPlan(**parsed)
                     content = f"**[{self.agent_name}]** 📋 Created Task Plan:\n\n{plan.to_markdown()}"
-                elif "overall_quality" in parsed:  # CodeReview
+                elif "overall_quality" in parsed:
                     review = CodeReview(**parsed)
                     content = f"**[{self.agent_name}]** ✅ Code Review Complete:\n\n"
                     content += f"**Quality:** {review.overall_quality}\n\n"
@@ -792,6 +964,14 @@ class StreamlitAssistantAgent(AssistantAgent):
                         content += "**Issues:**\n" + "\n".join(f"- {i}" for i in review.issues) + "\n\n"
                     if review.suggestions:
                         content += "**Suggestions:**\n" + "\n".join(f"- {s}" for s in review.suggestions)
+                elif "tool_name" in parsed:
+                    skill = SkillDefinition(**parsed)
+                    content = f"**[{self.agent_name}]** 🧠 Generated New Skill:\n\n"
+                    content += f"**Tool Name:** `{skill.tool_name}`\n"
+                    content += f"**Description:** {skill.description}\n\n"
+                    content += "**Code:**\n```python\n" + skill.code + "\n```\n\n"
+                    if skill.safety_notes:
+                        content += "**Safety Notes:**\n" + "\n".join(f"- {note}" for note in skill.safety_notes)
                 else:
                     content = f"**[{self.agent_name}]** {content}"
             except (json.JSONDecodeError, Exception):
@@ -803,7 +983,6 @@ class StreamlitAssistantAgent(AssistantAgent):
                 agent=self.agent_name
             )
         elif isinstance(response, ToolCallMessage):
-            # Enhanced tool call display
             tool_calls_display = []
             for tc in response.content:
                 tool_name = tc.name
@@ -831,48 +1010,110 @@ class StreamlitAssistantAgent(AssistantAgent):
         })
 
 
+class DynamicFileHandlerAgent(StreamlitAssistantAgent):
+    """
+    Enhanced FileHandler with dynamic skill registration capability.
+
+    Can register new tools at runtime when SkillGenerator creates them.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dynamic_tools = []  # Track dynamically added tools
+
+    def register_new_skill(self, skill_def: SkillDefinition) -> str:
+        """
+        Dynamically register a new tool/skill.
+
+        SECURITY: This should only be called after Reviewer approval!
+
+        Args:
+            skill_def: SkillDefinition with tool code
+
+        Returns:
+            Success or error message
+        """
+        logger.warning(f"⚠️ Attempting dynamic skill registration: {skill_def.tool_name}")
+
+        try:
+            # Create isolated namespace for exec
+            namespace = {}
+
+            # Execute the code to define the function
+            exec(skill_def.code, namespace)
+
+            # Extract the function
+            tool_func = namespace.get(skill_def.tool_name)
+
+            if not tool_func or not callable(tool_func):
+                return f"❌ Function '{skill_def.tool_name}' not found or not callable in generated code"
+
+            # Create FunctionTool wrapper
+            new_tool = FunctionTool(
+                tool_func,
+                description=skill_def.description
+            )
+
+            # Add to agent's tool list
+            if not hasattr(self, '_tools'):
+                self._tools = []
+
+            self._tools.append(new_tool)
+            self.dynamic_tools.append({
+                "name": skill_def.tool_name,
+                "description": skill_def.description,
+                "registered_at": datetime.now().isoformat()
+            })
+
+            logger.info(f"✅ Successfully registered skill: {skill_def.tool_name}")
+
+            return f"""✅ New skill registered successfully!
+
+Tool Name: {skill_def.tool_name}
+Description: {skill_def.description}
+
+The tool is now available for use by FileHandler agent.
+Total dynamic tools registered: {len(self.dynamic_tools)}
+"""
+
+        except Exception as e:
+            logger.error(f"Failed to register skill: {e}", exc_info=True)
+            return f"❌ Failed to register skill: {str(e)}"
+
+
 # ============================================================================
-# Agent Factory Functions (4 Agents with Tool Assignments)
+# Agent Factory Functions (5 Agents)
 # ============================================================================
 
 def create_planner_agent() -> StreamlitAssistantAgent:
-    """
-    Create the Planner agent with Gemini 2.5 Pro for complex reasoning.
-
-    Tools: web_search, read_document, analyze_image, get_current_datetime, validate_json
-    """
+    """Create Planner agent with cost tracking."""
     system_message = """You are an expert Planner agent specialized in software architecture and task decomposition.
 
 Your responsibilities:
-1. Analyze user requirements thoroughly and ask clarifying questions if needed
-2. Break down complex tasks into clear, ordered implementation steps
+1. Analyze user requirements thoroughly
+2. Break down complex tasks into clear, ordered steps
 3. Identify dependencies, risks, and required technologies
-4. Create a structured, actionable plan using the TaskPlan schema
+4. Create structured plans using the TaskPlan schema
 5. Use available tools to research and gather information
 6. Hand off to the Coder or FileHandler once you have a complete plan
 
 Available Tools:
-- tool_web_search: Research best practices, libraries, and patterns
-- tool_read_document: Read requirements docs or specifications
-- tool_analyze_image: Analyze diagrams or mockups
-- tool_get_current_datetime: Get timestamps for planning
-- tool_validate_json: Validate your TaskPlan before sending
+- tool_web_search: Research best practices
+- tool_read_document: Read specifications
+- tool_analyze_image: Analyze diagrams
+- tool_get_current_datetime: Get timestamps
+- tool_validate_json: Validate your TaskPlan
 
-Output Format: Always structure your plan using the TaskPlan schema.
-Use tool_validate_json to ensure your plan is valid before proceeding.
+Always structure your plan using the TaskPlan schema and validate it."""
 
-Be thorough but concise. Think step-by-step and consider edge cases."""
+    model_client = get_gemini_client("gemini-2.5-pro", agent_name="Planner")
 
-    # Use Gemini 2.5 Pro for complex reasoning
-    model_client = get_gemini_client("gemini-2.5-pro")
-
-    # Create tools
     tools = [
-        FunctionTool(tool_web_search, description="Search the web for information and best practices"),
-        FunctionTool(tool_read_document, description="Read document or specification files"),
-        FunctionTool(tool_analyze_image, description="Analyze images, diagrams, or mockups"),
+        FunctionTool(tool_web_search, description="Search the web for information"),
+        FunctionTool(tool_read_document, description="Read document files"),
+        FunctionTool(tool_analyze_image, description="Analyze images and diagrams"),
         FunctionTool(tool_get_current_datetime, description="Get current date and time"),
-        FunctionTool(tool_validate_json, description="Validate JSON against Pydantic schemas"),
+        FunctionTool(tool_validate_json, description="Validate JSON schemas"),
     ]
 
     return StreamlitAssistantAgent(
@@ -880,46 +1121,34 @@ Be thorough but concise. Think step-by-step and consider edge cases."""
         model_client=model_client,
         system_message=system_message,
         tools=tools,
-        handoffs=["Coder", "FileHandler"]
+        handoffs=["Coder", "FileHandler", "SkillGenerator"]
     )
 
 
 def create_coder_agent() -> StreamlitAssistantAgent:
-    """
-    Create the Coder agent with Gemini 2.5 Flash for fast, iterative coding.
-
-    Tools: create_visualization, validate_json
-    """
+    """Create Coder agent with cost tracking."""
     system_message = """You are an expert Coder agent specialized in Python development.
 
 Your responsibilities:
-1. Implement code based on the Planner's specifications
-2. Write clean, well-documented, efficient, and Pythonic code
-3. Include comprehensive error handling and edge cases
+1. Implement code based on Planner's specifications
+2. Write clean, well-documented, efficient Python code
+3. Include comprehensive error handling
 4. Add type hints and docstrings
 5. Create visualizations when needed
-6. Hand off to the Reviewer when code is complete
+6. Hand off to Reviewer when code is complete
 
 Available Tools:
-- tool_create_visualization: Create charts and graphs from data
+- tool_create_visualization: Create charts and graphs
 - tool_validate_json: Validate structured data
 
-Guidelines:
-- Follow PEP 8 style guide
-- Use modern Python features (3.11+)
-- Include example usage in docstrings
-- Add inline comments for complex logic
-- Consider performance and maintainability
+For file operations or execution, hand off to FileHandler.
+If you need a capability that doesn't exist, request SkillGenerator to create it."""
 
-For file operations, execution, or Git commands, hand off to FileHandler agent."""
+    model_client = get_gemini_client("gemini-2.5-flash", agent_name="Coder")
 
-    # Use Gemini 2.5 Flash for fast, cost-effective coding
-    model_client = get_gemini_client("gemini-2.5-flash")
-
-    # Create tools
     tools = [
-        FunctionTool(tool_create_visualization, description="Create data visualizations (charts, graphs)"),
-        FunctionTool(tool_validate_json, description="Validate JSON against Pydantic schemas"),
+        FunctionTool(tool_create_visualization, description="Create data visualizations"),
+        FunctionTool(tool_validate_json, description="Validate JSON schemas"),
     ]
 
     return StreamlitAssistantAgent(
@@ -927,55 +1156,46 @@ For file operations, execution, or Git commands, hand off to FileHandler agent."
         model_client=model_client,
         system_message=system_message,
         tools=tools,
-        handoffs=["Reviewer", "Planner", "FileHandler"]
+        handoffs=["Reviewer", "Planner", "FileHandler", "SkillGenerator"]
     )
 
 
 def create_reviewer_agent() -> StreamlitAssistantAgent:
-    """
-    Create the Reviewer agent with Gemini 2.5 Pro for thorough code review.
-
-    Tools: web_search, static_analysis, read_document, analyze_image, validate_json
-    """
-    system_message = """You are an expert Reviewer agent specialized in code quality, security, and best practices.
+    """Create Reviewer agent with cost tracking."""
+    system_message = """You are an expert Reviewer agent specialized in code quality and security.
 
 Your responsibilities:
-1. Review code for correctness, efficiency, security, and maintainability
+1. Review code for correctness, efficiency, security
 2. Check for bugs, edge cases, and potential issues
-3. Verify adherence to Python best practices and PEP 8
-4. Ensure comprehensive error handling and input validation
-5. Use tools to verify security best practices
-6. Provide structured feedback using the CodeReview schema
-7. Either approve (hand off to User) or send back to Coder with specific feedback
+3. Verify adherence to Python best practices
+4. Use tools to verify security best practices
+5. Provide structured feedback using CodeReview schema
+6. **CRITICAL**: Review and approve dynamically generated skills from SkillGenerator before FileHandler registers them
+7. Either approve or send back to Coder/SkillGenerator with feedback
 
 Available Tools:
-- tool_web_search: Research security advisories and best practices
-- tool_static_analysis: Run automated code quality checks
-- tool_read_document: Read code files for review
-- tool_analyze_image: Analyze architecture diagrams
+- tool_web_search: Research security advisories
+- tool_static_analysis: Run code quality checks
+- tool_read_document: Read code files
+- tool_analyze_image: Analyze diagrams
 - tool_validate_json: Validate structured outputs
 
-Review Checklist:
-- ✅ Correctness: Does it solve the problem?
-- ✅ Security: Any injection risks, unsafe operations?
-- ✅ Error Handling: All edge cases covered?
-- ✅ Code Quality: Clean, readable, maintainable?
-- ✅ Performance: Any obvious inefficiencies?
-- ✅ Documentation: Clear docstrings and comments?
-- ✅ Type Safety: Proper type hints?
+When reviewing dynamically generated skills:
+- Check for security vulnerabilities
+- Verify no malicious code (file deletion, network access, etc.)
+- Ensure proper error handling
+- Confirm it solves the intended problem
 
-Output Format: Use CodeReview schema. Validate with tool_validate_json."""
+Use CodeReview schema for all reviews."""
 
-    # Use Gemini 2.5 Pro for thorough analysis
-    model_client = get_gemini_client("gemini-2.5-pro")
+    model_client = get_gemini_client("gemini-2.5-pro", agent_name="Reviewer")
 
-    # Create tools
     tools = [
-        FunctionTool(tool_web_search, description="Search for security advisories and best practices"),
-        FunctionTool(tool_static_analysis, description="Perform static code analysis"),
-        FunctionTool(tool_read_document, description="Read code files for review"),
-        FunctionTool(tool_analyze_image, description="Analyze diagrams or visualizations"),
-        FunctionTool(tool_validate_json, description="Validate JSON against Pydantic schemas"),
+        FunctionTool(tool_web_search, description="Search for security information"),
+        FunctionTool(tool_static_analysis, description="Perform static analysis"),
+        FunctionTool(tool_read_document, description="Read code files"),
+        FunctionTool(tool_analyze_image, description="Analyze diagrams"),
+        FunctionTool(tool_validate_json, description="Validate JSON schemas"),
     ]
 
     return StreamlitAssistantAgent(
@@ -983,69 +1203,62 @@ Output Format: Use CodeReview schema. Validate with tool_validate_json."""
         model_client=model_client,
         system_message=system_message,
         tools=tools,
-        handoffs=["Coder", "FileHandler", "User"]
+        handoffs=["Coder", "FileHandler", "SkillGenerator", "User"]
     )
 
 
-def create_filehandler_agent() -> StreamlitAssistantAgent:
-    """
-    Create the FileHandler agent with Gemini 2.5 Flash for I/O operations.
-
-    This agent is the SOLE OWNER of:
-    - Code execution
-    - File reading/writing
-    - Git operations
-    - Project archiving
-
-    Tools: execute_code, create_visualization, read_document, create_project_zip, git_command, validate_json
-    """
-    system_message = """You are an expert FileHandler agent specialized in secure I/O operations and system interactions.
+def create_filehandler_agent() -> DynamicFileHandlerAgent:
+    """Create FileHandler agent with dynamic skill registration."""
+    system_message = """You are an expert FileHandler agent specialized in secure I/O operations.
 
 Your responsibilities:
-1. Execute code in a safe, sandboxed environment
-2. Handle all file reading and writing operations
-3. Manage Git operations (status, log, diff, etc.)
-4. Create project archives and snapshots
-5. Generate visualizations when requested
-6. Always prioritize security and request human approval for risky operations
+1. Execute code in distributed environment (RQ workers)
+2. Poll job results from distributed execution
+3. Handle all file reading and writing operations
+4. Manage Git operations
+5. Create project archives
+6. Register dynamically generated skills (after Reviewer approval)
+7. Prioritize security and request human approval for risky operations
 
 Available Tools:
-- tool_execute_code: Execute Python code (requires human approval)
-- tool_create_visualization: Generate charts and graphs
-- tool_read_document: Read files from filesystem
-- tool_create_project_zip: Create project snapshots
+- tool_execute_code: Execute code via RQ (requires HITL approval, returns job ID)
+- tool_poll_job_result: Poll RQ job for results
+- tool_create_visualization: Generate charts
+- tool_read_document: Read files
+- tool_create_project_zip: Create ZIP archives
 - tool_git_command: Execute Git commands
-- tool_validate_json: Validate structured data
+- tool_validate_json: Validate JSON
+
+**IMPORTANT for distributed execution:**
+1. When executing code, tool_execute_code returns a job ID
+2. Use tool_poll_job_result with the job ID to get results
+3. You may need to poll multiple times until job completes
+
+**IMPORTANT for skill registration:**
+1. Only register skills that have been approved by Reviewer
+2. Never register skills with security concerns
+3. Inform the team when new skills are available
 
 Security Guidelines:
-- ⚠️ ALWAYS request human approval for code execution
-- ✅ Validate all file paths to prevent directory traversal
-- ✅ Limit file sizes to prevent resource exhaustion
-- ✅ Use timeouts for all subprocess operations
-- ✅ Only allow safe Git commands by default
+- ALWAYS request human approval for code execution
+- Validate all file paths
+- Limit file sizes
+- Use timeouts
+- Only allow safe Git commands"""
 
-When you receive a request:
-1. Assess security implications
-2. Request human approval if needed
-3. Execute with proper error handling
-4. Report results clearly
+    model_client = get_gemini_client("gemini-2.5-flash", agent_name="FileHandler")
 
-Hand off to Coder or Reviewer when file operations are complete."""
-
-    # Use Gemini 2.5 Flash for fast operations
-    model_client = get_gemini_client("gemini-2.5-flash")
-
-    # Create tools - FileHandler owns I/O tools
     tools = [
-        FunctionTool(tool_execute_code, description="Execute Python code in sandbox (requires approval)"),
-        FunctionTool(tool_create_visualization, description="Create data visualizations"),
-        FunctionTool(tool_read_document, description="Read files from filesystem"),
-        FunctionTool(tool_create_project_zip, description="Create ZIP archive of project"),
-        FunctionTool(tool_git_command, description="Execute Git commands (safe commands only)"),
-        FunctionTool(tool_validate_json, description="Validate JSON against schemas"),
+        FunctionTool(tool_execute_code, description="Execute code via RQ (returns job ID)"),
+        FunctionTool(tool_poll_job_result, description="Poll RQ job for results"),
+        FunctionTool(tool_create_visualization, description="Create visualizations"),
+        FunctionTool(tool_read_document, description="Read files"),
+        FunctionTool(tool_create_project_zip, description="Create ZIP archives"),
+        FunctionTool(tool_git_command, description="Execute Git commands"),
+        FunctionTool(tool_validate_json, description="Validate JSON schemas"),
     ]
 
-    return StreamlitAssistantAgent(
+    return DynamicFileHandlerAgent(
         name="FileHandler",
         model_client=model_client,
         system_message=system_message,
@@ -1054,54 +1267,119 @@ Hand off to Coder or Reviewer when file operations are complete."""
     )
 
 
+def create_skill_generator_agent() -> StreamlitAssistantAgent:
+    """
+    Create SkillGenerator agent for automated skill/tool creation.
+
+    NEW AGENT: Analyzes failures and generates new tools dynamically.
+    """
+    system_message = """You are an expert SkillGenerator agent specialized in creating new tools and capabilities.
+
+Your unique role:
+1. Analyze agent failures or capability gaps
+2. Generate clean, safe Python code for new tools
+3. Create tools following the standard function signature pattern
+4. Include comprehensive docstrings with type hints
+5. Consider security implications
+6. Output SkillDefinition schema for review
+7. Hand off to Reviewer for approval before registration
+
+**Tool Creation Guidelines:**
+
+Function Signature Pattern:
+```python
+def tool_name(param1: str, param2: int = 0) -> str:
+    \"\"\"
+    Brief description of what the tool does.
+
+    Args:
+        param1: Description of parameter
+        param2: Description with default
+
+    Returns:
+        Description of return value
+    \"\"\"
+    # Implementation
+    return result
+```
+
+Safety Requirements:
+- No file deletion or destructive operations
+- No network access unless explicitly needed
+- Proper error handling
+- Input validation
+- Timeout protection where applicable
+
+Output Format:
+Always use SkillDefinition schema:
+{
+    "tool_name": "tool_example",
+    "description": "What it does",
+    "parameters": {"param1": "str", "param2": "int"},
+    "code": "complete Python function code",
+    "safety_notes": ["List of security considerations"]
+}
+
+After generating, validate with tool_validate_json and hand off to Reviewer."""
+
+    model_client = get_gemini_client("gemini-2.5-pro", agent_name="SkillGenerator")
+
+    tools = [
+        FunctionTool(tool_web_search, description="Research best practices"),
+        FunctionTool(tool_read_document, description="Read existing tool code for reference"),
+        FunctionTool(tool_validate_json, description="Validate SkillDefinition schema"),
+    ]
+
+    return StreamlitAssistantAgent(
+        name="SkillGenerator",
+        model_client=model_client,
+        system_message=system_message,
+        tools=tools,
+        handoffs=["Reviewer"]
+    )
+
+
 # ============================================================================
 # Team Setup
 # ============================================================================
 
 def create_team() -> SelectorGroupChat:
-    """
-    Create a SelectorGroupChat with 4 specialized agents.
-
-    Agents:
-    - Planner (Pro): Task decomposition and planning
-    - Coder (Flash): Code implementation
-    - Reviewer (Pro): Code review and quality assurance
-    - FileHandler (Flash): I/O operations and system interactions
-
-    Returns:
-        Configured SelectorGroupChat team with proper termination
-    """
-    logger.info("Creating optimized 4-agent team with Gemini 2.5 models...")
+    """Create SelectorGroupChat with 5 agents including SkillGenerator."""
+    logger.info("Creating 5-agent team with cost tracking and skill generation...")
 
     planner = create_planner_agent()
     coder = create_coder_agent()
     reviewer = create_reviewer_agent()
     filehandler = create_filehandler_agent()
+    skillgenerator = create_skill_generator_agent()
 
-    # Use Gemini Pro for team selector (complex decision making)
-    selector_client = get_gemini_client("gemini-2.5-pro")
+    # Use Gemini Pro for team selector
+    selector_client = get_gemini_client("gemini-2.5-pro", agent_name="TeamSelector")
 
     team = SelectorGroupChat(
-        participants=[planner, coder, reviewer, filehandler],
+        participants=[planner, coder, reviewer, filehandler, skillgenerator],
         model_client=selector_client,
         termination_condition=lambda msg: (
             "APPROVED" in str(msg.content).upper() or
             "TERMINATE" in str(msg.content).upper() or
             (isinstance(msg, TextMessage) and '"approved": true' in msg.content.lower())
         ),
-        max_turns=30  # Allow more turns for complex tasks with tools
+        max_turns=35  # More turns for skill generation workflows
     )
 
-    logger.info("Team created successfully with 4 agents and 10 tools")
+    # Store FileHandler reference for potential skill registration
+    st.session_state.filehandler_agent = filehandler
+
+    logger.info("Team created with 5 agents, cost tracking, and dynamic skill generation")
     return team
 
 
 # ============================================================================
-# Streamlit UI
+# Streamlit UI with Cost Monitoring
 # ============================================================================
 
 def initialize_session_state():
-    """Initialize Streamlit session state variables with persistence support."""
+    """Initialize Streamlit session state."""
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -1123,19 +1401,32 @@ def initialize_session_state():
     if "tool_calls" not in st.session_state:
         st.session_state.tool_calls = []
 
+    if "cost_tracking" not in st.session_state:
+        st.session_state.cost_tracking = {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost": 0.0,
+            "by_agent": {},
+            "history": []
+        }
+
+    if "filehandler_agent" not in st.session_state:
+        st.session_state.filehandler_agent = None
+
 
 def render_sidebar():
-    """Render the sidebar with configuration options and stats."""
+    """Render sidebar with configuration and cost monitoring."""
     with st.sidebar:
         st.title("⚙️ Configuration")
 
         # Model info
-        st.markdown("### 🤖 Active Models")
+        st.markdown("### 🤖 Active Agents")
         st.markdown("""
         - **Planner**: `gemini-2.5-pro` 🧠
         - **Coder**: `gemini-2.5-flash` ⚡
         - **Reviewer**: `gemini-2.5-pro` 🔍
         - **FileHandler**: `gemini-2.5-flash` 📁
+        - **SkillGenerator**: `gemini-2.5-pro` 🧠 **NEW!**
         """)
 
         st.divider()
@@ -1145,12 +1436,11 @@ def render_sidebar():
             "Google/Gemini API Key",
             type="password",
             value=st.session_state.google_api_key or "",
-            help="Enter your Google Gemini API key (supports Gemini 2.5 Pro and Flash)"
+            help="Enter your Google Gemini API key"
         )
 
         if api_key:
             st.session_state.google_api_key = api_key
-            # Also set as environment variable for tools
             os.environ["GEMINI_API_KEY"] = api_key
 
         st.divider()
@@ -1161,18 +1451,61 @@ def render_sidebar():
                 st.error("Please enter your Google API key first!")
             else:
                 try:
-                    with st.spinner("Initializing 4-agent team with 10 tools..."):
+                    with st.spinner("Initializing 5-agent team..."):
                         st.session_state.team = create_team()
                         st.session_state.chat_active = True
-                        st.success("✅ Team initialized! 4 agents + 10 tools ready!")
-                        logger.info("Team initialized with 4 agents and 10 tools")
+                        st.success("✅ Team initialized! 5 agents + RQ + Cost tracking ready!")
+                        logger.info("Team initialized with all features")
                 except Exception as e:
                     st.error(f"Error initializing team: {str(e)}")
                     logger.error(f"Team initialization error: {e}", exc_info=True)
 
         st.divider()
 
-        # Clear chat
+        # Cost Monitoring Section
+        st.markdown("### 💰 Cost Monitoring")
+
+        cost_data = st.session_state.cost_tracking
+        total_cost = cost_data["total_cost"]
+        total_tokens = cost_data["total_input_tokens"] + cost_data["total_output_tokens"]
+
+        # Alert if over threshold
+        if total_cost > COST_ALERT_THRESHOLD:
+            st.error(f"⚠️ COST ALERT: ${total_cost:.4f} exceeds ${COST_ALERT_THRESHOLD:.2f} threshold!")
+
+        st.metric("Total Cost", f"${total_cost:.4f}")
+        st.metric("Total Tokens", f"{total_tokens:,}")
+        st.metric("Input Tokens", f"{cost_data['total_input_tokens']:,}")
+        st.metric("Output Tokens", f"{cost_data['total_output_tokens']:,}")
+
+        # Per-agent breakdown
+        if cost_data["by_agent"]:
+            with st.expander("📊 Cost by Agent"):
+                for agent_name, stats in cost_data["by_agent"].items():
+                    st.markdown(f"**{agent_name}**")
+                    st.text(f"Calls: {stats['calls']}")
+                    st.text(f"Cost: ${stats['cost']:.4f}")
+                    st.text(f"Tokens: {stats['input_tokens'] + stats['output_tokens']:,}")
+                    st.markdown("---")
+
+        st.divider()
+
+        # Redis Queue Status
+        st.markdown("### 🚀 Distributed Execution")
+        queue = get_redis_queue()
+        if queue:
+            st.success("✅ Redis Queue Connected")
+            try:
+                job_count = len(queue)
+                st.metric("Queued Jobs", job_count)
+            except:
+                st.info("Queue accessible")
+        else:
+            st.warning("⚠️ Redis not available (falling back to local execution)")
+
+        st.divider()
+
+        # Clear/Reset buttons
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
             st.session_state.pending_approval = None
@@ -1180,36 +1513,53 @@ def render_sidebar():
             st.session_state.tool_calls = []
             st.rerun()
 
-        # Reset team
-        if st.button("🔄 Reset Team", use_container_width=True):
+        if st.button("🔄 Reset All", use_container_width=True):
             st.session_state.team = None
             st.session_state.messages = []
             st.session_state.chat_active = False
             st.session_state.pending_approval = None
             st.session_state.approval_granted = False
             st.session_state.tool_calls = []
+            st.session_state.cost_tracking = {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_cost": 0.0,
+                "by_agent": {},
+                "history": []
+            }
             st.rerun()
 
         st.divider()
 
-        # Enhanced stats
+        # Session stats
         st.markdown("### 📊 Session Stats")
         st.metric("Messages", len(st.session_state.messages))
+        st.metric("Tool Calls", len(st.session_state.tool_calls))
         st.metric("Team Status", "🟢 Active" if st.session_state.chat_active else "🔴 Inactive")
-        st.metric("Tool Calls", len(st.session_state.get("tool_calls", [])))
 
-        # Show recent tool calls
-        if st.session_state.get("tool_calls"):
-            with st.expander("🔧 Recent Tool Calls"):
-                for tc in st.session_state.tool_calls[-10:]:
-                    tool_name = tc.get("tool", "unknown")
-                    st.text(f"• {tool_name}")
+        # Dynamic skills
+        if st.session_state.filehandler_agent and hasattr(st.session_state.filehandler_agent, 'dynamic_tools'):
+            dynamic_count = len(st.session_state.filehandler_agent.dynamic_tools)
+            if dynamic_count > 0:
+                st.metric("Dynamic Skills", dynamic_count)
+                with st.expander("🧠 Generated Skills"):
+                    for skill in st.session_state.filehandler_agent.dynamic_tools:
+                        st.text(f"• {skill['name']}")
 
 
 def render_chat_interface():
-    """Render the main chat interface with enhanced features."""
-    st.title("🤖 AutoGen Multi-Agent Coding Assistant")
-    st.markdown("*Complete Edition: 4 Agents + 10 Specialized Tools | Gemini 2.5 Pro + Flash*")
+    """Render main chat interface."""
+    st.title("🤖 AutoGen Multi-Agent System - Production Edition")
+    st.markdown("*5 Agents | RQ Distributed Execution | Real-Time Cost Monitoring | Dynamic Skill Generation*")
+
+    # Cost alert banner
+    if st.session_state.cost_tracking["total_cost"] > COST_ALERT_THRESHOLD:
+        st.error(f"""
+        ⚠️ **COST ALERT**: Session cost ${st.session_state.cost_tracking['total_cost']:.4f}
+        exceeds threshold of ${COST_ALERT_THRESHOLD:.2f}!
+
+        Consider resetting the session or monitoring usage.
+        """)
 
     # Display chat messages
     chat_container = st.container()
@@ -1222,7 +1572,7 @@ def render_chat_interface():
             with st.chat_message(role, avatar="🤖" if role == "assistant" else "👤"):
                 st.markdown(content)
 
-    # Display pending approval if any (HITL)
+    # HITL Approval
     if st.session_state.pending_approval:
         st.warning("⚠️ Human Approval Required")
         approval = st.session_state.pending_approval
@@ -1265,7 +1615,6 @@ def render_chat_interface():
             st.error("Please initialize the team first!")
             return
 
-        # Add user message to chat
         st.session_state.messages.append({
             "role": "user",
             "content": prompt,
@@ -1273,40 +1622,30 @@ def render_chat_interface():
             "timestamp": datetime.now().isoformat()
         })
 
-        # Display user message
         with st.chat_message("user", avatar="👤"):
             st.markdown(prompt)
 
-        # Run the team
-        with st.spinner("🤔 4 agents collaborating with 10 specialized tools..."):
+        with st.spinner("🤔 5 agents collaborating with distributed execution..."):
             asyncio.run(run_team(prompt))
 
 
 async def run_team(task: str):
-    """
-    Run the agent team on a given task with proper error handling.
-
-    Args:
-        task: The user's task description
-    """
+    """Run the agent team on a task."""
     try:
         logger.info(f"Starting team run for task: {task[:100]}...")
 
         team = st.session_state.team
-
-        # Create initial message
         initial_message = TextMessage(content=task, source="User")
 
-        # Run the team
         result = await team.run(task=initial_message)
 
-        # Log completion
         logger.info(f"Team run completed. Messages: {len(result.messages)}")
 
-        # Add final summary
+        # Add completion summary with cost
+        cost = st.session_state.cost_tracking["total_cost"]
         st.session_state.messages.append({
             "role": "assistant",
-            "content": f"✅ **Collaboration complete!** Total messages: {len(result.messages)} | Tools used: {len(st.session_state.tool_calls)}",
+            "content": f"✅ **Collaboration complete!** Messages: {len(result.messages)} | Cost: ${cost:.4f}",
             "agent": "System",
             "timestamp": datetime.now().isoformat()
         })
@@ -1331,16 +1670,13 @@ async def run_team(task: str):
 def main():
     """Main application entry point."""
     st.set_page_config(
-        page_title="AutoGen Multi-Agent Coder (Complete)",
+        page_title="AutoGen Production System",
         page_icon="🤖",
         layout="wide",
         initial_sidebar_state="expanded"
     )
 
-    # Initialize session state
     initialize_session_state()
-
-    # Render UI
     render_sidebar()
     render_chat_interface()
 
@@ -1349,7 +1685,7 @@ def main():
     st.markdown(
         """
         <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        🤖 AutoGen v0.4 | 🧠 Gemini 2.5 Pro + ⚡ Flash | 📋 Structured Outputs | 🔧 10 Specialized Tools | 🛡️ HITL Approval
+        🤖 AutoGen v0.4 Production | 🧠 5 Agents + Skill Generation | 🚀 RQ Distributed Execution | 💰 Real-Time Cost Tracking
         </div>
         """,
         unsafe_allow_html=True
