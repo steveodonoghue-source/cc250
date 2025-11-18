@@ -364,12 +364,22 @@ class TestCostTracking:
         from conftest import MockChatResponse, MockUsage
 
         # Arrange: Create tracking client
+        from autogen_ext.models.openai import ModelInfo
+        model_info = ModelInfo(
+            vision=True,
+            function_calling=True,
+            json_output=True,
+            family="gemini",
+            structured_output=True
+        )
+
         with patch('streamlit_app.OpenAIChatCompletionClient'):
             with patch('streamlit_app.st.session_state', mock_streamlit_session):
                 client = CostTrackingChatClient(
                     agent_name="TestAgent",
                     model="gemini-2.5-pro",
-                    api_key="test_key"
+                    api_key="test_key",
+                    model_info=model_info
                 )
 
                 # Mock the parent create method
