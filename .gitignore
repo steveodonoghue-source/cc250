@@ -45,6 +45,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Database files (runtime data)
+*.db
+
 # Chat history (if saved)
 chat_history.json
 
