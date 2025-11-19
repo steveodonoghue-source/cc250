@@ -244,7 +244,7 @@ def initialize_unsafe_patterns(cursor):
         },
         {
             "name": "SQL Injection Risk",
-            "regex": r"execute\s*\(\s*['\"].*%s.*['\"]|execute\s*\(\s*f['\"]",
+            "regex": r"execute\s*\(\s*['\"].*%s.*['\"]|execute\s*\(\s*f['\"]|f['\"].*?\b(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER)\b",
             "risk": "high",
             "description": "String formatting in SQL queries can lead to injection",
             "recommendation": "Use parameterized queries with ? placeholders"
@@ -625,22 +625,34 @@ def calculate_quality_score(skill_id: int) -> Dict:
         scores["performance_score"] = 50.0  # Neutral if not benchmarked
 
     # 4. Documentation Score (10%)
-    # Get skill details
-    cursor.execute("""
-        SELECT description, safety_notes
-        FROM skills WHERE id = ?
-    """, (skill_id,))
+    # Get skill details from main database
+    try:
+        # Connect to main database for skill info
+        import database as db
+        main_conn = sqlite3.connect(db.DB_PATH)
+        main_conn.row_factory = sqlite3.Row
+        main_cursor = main_conn.cursor()
 
-    skill = cursor.fetchone()
-    if skill:
-        doc_score = 0.0
-        if skill['description'] and len(skill['description']) > 50:
-            doc_score += 50
-        if skill['safety_notes']:
-            notes = json.loads(skill['safety_notes']) if isinstance(skill['safety_notes'], str) else skill['safety_notes']
-            if notes and len(notes) > 0:
+        main_cursor.execute("""
+            SELECT description, safety_notes
+            FROM skills WHERE id = ?
+        """, (skill_id,))
+
+        skill = main_cursor.fetchone()
+        if skill:
+            doc_score = 0.0
+            if skill['description'] and len(skill['description']) > 50:
                 doc_score += 50
-        scores["documentation_score"] = doc_score
+            if skill['safety_notes']:
+                notes = json.loads(skill['safety_notes']) if isinstance(skill['safety_notes'], str) else skill['safety_notes']
+                if notes and len(notes) > 0:
+                    doc_score += 50
+            scores["documentation_score"] = doc_score
+
+        main_conn.close()
+    except Exception:
+        # If skill not found in main database, use default score
+        scores["documentation_score"] = 50.0
 
     # Calculate overall score (weighted average)
     scores["overall_score"] = (
