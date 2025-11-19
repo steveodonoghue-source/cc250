@@ -1935,9 +1935,17 @@ def render_chat_interface():
             agent = message.get("agent", "Unknown")
             content = message.get("content", "")
             role = message.get("role", "assistant")
+            image_path = message.get("image_path")
 
             with st.chat_message(role, avatar="🤖" if role == "assistant" else "👤"):
-                st.markdown(content)
+                # Display image if present
+                if image_path:
+                    try:
+                        st.image(image_path, caption=content, use_container_width=True)
+                    except:
+                        st.markdown(content)
+                else:
+                    st.markdown(content)
 
     # HITL Approval
     if st.session_state.pending_approval:
@@ -1975,6 +1983,107 @@ def render_chat_interface():
                     "timestamp": datetime.now().isoformat()
                 })
                 st.rerun()
+
+    # File uploader for multimodal input
+    st.markdown("### 📎 Upload Files (Optional)")
+    uploaded_files = st.file_uploader(
+        "Upload images, PDFs, or documents for analysis",
+        type=['png', 'jpg', 'jpeg', 'pdf', 'docx', 'txt', 'md', 'py', 'json', 'csv'],
+        accept_multiple_files=True,
+        help="Images will be analyzed, documents will be ingested into knowledge base"
+    )
+
+    if uploaded_files:
+        # Process new uploads
+        for uploaded_file in uploaded_files:
+            file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+
+            # Check if already processed
+            already_processed = any(f['id'] == file_id for f in st.session_state.uploaded_files)
+
+            if not already_processed and st.session_state.chat_active:
+                # Save file temporarily
+                import tempfile
+                import os
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = tmp_file.name
+
+                # Determine file type and process
+                file_type = uploaded_file.type
+                file_name = uploaded_file.name
+
+                if file_type.startswith('image/'):
+                    # Process image with tool_analyze_image
+                    st.session_state.messages.append({
+                        "role": "user",
+                        "content": f"🖼️ **Uploaded image:** {file_name}",
+                        "agent": "User",
+                        "timestamp": datetime.now().isoformat(),
+                        "image_path": tmp_path
+                    })
+
+                    # Analyze image
+                    with st.spinner(f"Analyzing {file_name}..."):
+                        analysis_result = tool_analyze_image(tmp_path)
+
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"**Image Analysis ({file_name}):**\n\n{analysis_result}",
+                        "agent": "Vision",
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                else:
+                    # Ingest document into ChromaDB
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"📄 **Ingesting document:** {file_name}",
+                        "agent": "System",
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                    ingest_result = tool_ingest_document(tmp_path)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"**Document Ingested ({file_name}):**\n\n{ingest_result}",
+                        "agent": "FileHandler",
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                # Track uploaded file
+                st.session_state.uploaded_files.append({
+                    'id': file_id,
+                    'name': file_name,
+                    'type': file_type,
+                    'size': uploaded_file.size,
+                    'path': tmp_path,
+                    'timestamp': datetime.now().isoformat()
+                })
+
+                # Clean up temp file for non-image files
+                if not file_type.startswith('image/'):
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
+
+        # Show uploaded files
+        if st.session_state.uploaded_files:
+            with st.expander(f"📁 Uploaded Files ({len(st.session_state.uploaded_files)})", expanded=False):
+                for file_info in st.session_state.uploaded_files:
+                    col1, col2, col3 = st.columns([3, 1, 1])
+                    with col1:
+                        st.text(f"📄 {file_info['name']}")
+                    with col2:
+                        size_kb = file_info['size'] / 1024
+                        st.caption(f"{size_kb:.1f} KB")
+                    with col3:
+                        file_type_icon = "🖼️" if file_info['type'].startswith('image/') else "📄"
+                        st.caption(file_type_icon)
+
+    st.divider()
 
     # Chat input
     if prompt := st.chat_input("Describe your coding task...", disabled=not st.session_state.chat_active):
