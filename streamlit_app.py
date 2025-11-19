@@ -29,6 +29,8 @@ from autogen_agentchat.teams import SelectorGroupChat
 import database as db
 import database_marketplace as db_market
 import database_cost_optimization as db_cost
+import database_orchestration as db_orch
+import database_testing_quality as db_test
 from autogen_agentchat.messages import (
     ChatMessage,
     TextMessage,
@@ -2967,6 +2969,259 @@ def render_sidebar():
 
             except Exception as e:
                 st.error(f"Analytics error: {e}")
+
+        st.divider()
+
+        # Advanced Orchestration (Feature #10)
+        st.markdown("### 🔄 Advanced Orchestration")
+
+        orch_tab1, orch_tab2, orch_tab3 = st.tabs(["🔀 Workflows", "📋 Templates", "🎯 Routing"])
+
+        with orch_tab1:
+            st.markdown("#### Workflow Management")
+
+            try:
+                # List workflows
+                workflows = db_orch.list_workflows(active_only=True)
+
+                if workflows:
+                    workflow_names = {w['name']: w['id'] for w in workflows}
+                    selected_workflow_name = st.selectbox(
+                        "Select Workflow",
+                        ["Create New..."] + list(workflow_names.keys()),
+                        key="workflow_select"
+                    )
+
+                    if selected_workflow_name != "Create New...":
+                        workflow_id = workflow_names[selected_workflow_name]
+                        workflow = db_orch.get_workflow(workflow_id)
+
+                        if workflow:
+                            st.markdown(f"**{workflow['name']}**")
+                            st.caption(workflow['description'])
+                            st.text(f"Type: {workflow['workflow_type']}")
+                            st.text(f"Steps: {len(workflow.get('steps', []))}")
+
+                            # Show steps
+                            if workflow.get('steps'):
+                                with st.expander("View Steps"):
+                                    for step in workflow['steps']:
+                                        st.text(f"Step {step['step_number']}: {step['agent_name']}")
+                                        if step['task_description']:
+                                            st.caption(step['task_description'])
+                else:
+                    st.info("No workflows created yet")
+
+                # Create new workflow
+                with st.expander("➕ Create Workflow"):
+                    wf_name = st.text_input("Workflow Name", key="new_wf_name")
+                    wf_desc = st.text_area("Description", key="new_wf_desc")
+                    wf_type = st.selectbox("Type", ["sequential", "parallel", "conditional", "hybrid"], key="new_wf_type")
+
+                    if st.button("Create", key="create_wf_btn"):
+                        if wf_name:
+                            try:
+                                wf_id = db_orch.create_workflow(
+                                    name=wf_name,
+                                    description=wf_desc,
+                                    workflow_type=wf_type,
+                                    config={"type": wf_type, "steps": []},
+                                    created_by="streamlit_user"
+                                )
+                                st.success(f"✅ Created workflow: {wf_name} (ID: {wf_id})")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed: {e}")
+
+            except Exception as e:
+                st.error(f"Workflow error: {e}")
+
+        with orch_tab2:
+            st.markdown("#### Workflow Templates")
+
+            try:
+                templates = db_orch.list_workflow_templates()
+
+                if templates:
+                    for template in templates[:5]:  # Show top 5
+                        with st.expander(f"{template['name']} - {template['complexity_level']}"):
+                            st.text(template['description'])
+                            st.caption(f"Category: {template.get('category', 'N/A')}")
+                            st.caption(f"Use case: {template.get('use_case', 'N/A')}")
+                            st.caption(f"Duration: {template.get('estimated_duration', 'N/A')}")
+
+                            if st.button("Use Template", key=f"use_template_{template['id']}"):
+                                st.info("Template ready to use via API")
+                else:
+                    st.info("No templates available")
+
+            except Exception as e:
+                st.error(f"Template error: {e}")
+
+        with orch_tab3:
+            st.markdown("#### Smart Task Routing")
+
+            try:
+                # Show agent specializations
+                agents = ["Planner", "Coder", "FileHandler", "Reviewer", "SkillGenerator", "Executor"]
+
+                selected_agent = st.selectbox("View Agent Specializations", agents, key="agent_spec_select")
+
+                if selected_agent:
+                    specs = db_orch.get_agent_specializations(selected_agent)
+
+                    if specs:
+                        st.markdown(f"**{selected_agent} Specializations:**")
+                        for spec in specs:
+                            prof_stars = "⭐" * spec['proficiency_level']
+                            st.text(f"{spec['specialization_area']}: {prof_stars}")
+                            st.caption(f"Success Rate: {spec['success_rate']*100:.0f}% | Tasks: {spec['task_count']}")
+
+            except Exception as e:
+                st.error(f"Routing error: {e}")
+
+        st.divider()
+
+        # Skill Testing & Quality (Feature #11)
+        st.markdown("### 🧪 Testing & Quality")
+
+        test_tab1, test_tab2, test_tab3 = st.tabs(["🔍 Safety", "📊 Quality", "🏆 Leaderboard"])
+
+        with test_tab1:
+            st.markdown("#### Safety Analysis")
+
+            try:
+                # Get skills for testing
+                all_skills = db.list_skills(active_only=True, limit=100)
+
+                if all_skills:
+                    skill_names = {s['tool_name']: s for s in all_skills}
+                    selected_skill = st.selectbox(
+                        "Select Skill to Analyze",
+                        list(skill_names.keys()),
+                        key="safety_skill_select"
+                    )
+
+                    if selected_skill and st.button("Run Safety Check", key="run_safety"):
+                        skill = skill_names[selected_skill]
+                        try:
+                            risk_level, issues = db_test.check_code_safety(
+                                skill_id=skill['id'],
+                                code=skill['code']
+                            )
+
+                            # Display results
+                            risk_colors = {
+                                "none": "🟢",
+                                "low": "🟡",
+                                "medium": "🟠",
+                                "high": "🔴",
+                                "critical": "🚨"
+                            }
+
+                            st.markdown(f"**Risk Level:** {risk_colors.get(risk_level, '⚪')} {risk_level.upper()}")
+                            st.metric("Issues Found", len(issues))
+
+                            if issues:
+                                st.markdown("**Security Issues:**")
+                                for issue in issues[:5]:  # Show top 5
+                                    st.warning(f"Line {issue['line']}: {issue['pattern']}")
+                                    st.caption(issue['recommendation'])
+                            else:
+                                st.success("✅ No safety issues detected!")
+
+                        except Exception as e:
+                            st.error(f"Safety check failed: {e}")
+
+            except Exception as e:
+                st.error(f"Safety analysis error: {e}")
+
+        with test_tab2:
+            st.markdown("#### Quality Scores")
+
+            try:
+                all_skills = db.list_skills(active_only=True, limit=100)
+
+                if all_skills:
+                    skill_names = {s['tool_name']: s for s in all_skills}
+                    selected_skill_q = st.selectbox(
+                        "Select Skill for Quality Report",
+                        list(skill_names.keys()),
+                        key="quality_skill_select"
+                    )
+
+                    if selected_skill_q and st.button("Calculate Quality Score", key="calc_quality"):
+                        skill = skill_names[selected_skill_q]
+                        try:
+                            scores = db_test.calculate_quality_score(skill_id=skill['id'])
+
+                            # Display scores
+                            st.markdown("**Quality Breakdown:**")
+
+                            score_col1, score_col2 = st.columns(2)
+                            with score_col1:
+                                st.metric("Overall Score", f"{scores['overall_score']:.1f}/100")
+                                st.metric("Test Score", f"{scores['test_score']:.1f}/100")
+                            with score_col2:
+                                st.metric("Safety Score", f"{scores['safety_score']:.1f}/100")
+                                st.metric("Documentation", f"{scores['documentation_score']:.1f}/100")
+
+                            # Certification badge
+                            cert_level = scores['certification_level']
+                            cert_badges = {
+                                "platinum": "🏆 PLATINUM",
+                                "gold": "🥇 GOLD",
+                                "silver": "🥈 SILVER",
+                                "bronze": "🥉 BRONZE",
+                                "uncertified": "⚪ UNCERTIFIED"
+                            }
+
+                            st.markdown(f"**Certification:** {cert_badges.get(cert_level, cert_level.upper())}")
+
+                        except Exception as e:
+                            st.error(f"Quality calculation failed: {e}")
+
+            except Exception as e:
+                st.error(f"Quality scoring error: {e}")
+
+        with test_tab3:
+            st.markdown("#### Quality Leaderboard")
+
+            try:
+                # Get leaderboard from database
+                import sqlite3
+                conn = sqlite3.connect(db_test.DB_PATH)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT qs.overall_score, qs.certification_level, s.tool_name
+                    FROM quality_scores qs
+                    JOIN skills s ON qs.skill_id = s.id
+                    ORDER BY qs.overall_score DESC
+                    LIMIT 10
+                """)
+
+                leaderboard = cursor.fetchall()
+                conn.close()
+
+                if leaderboard:
+                    st.markdown("**Top 10 Skills by Quality:**")
+                    for idx, entry in enumerate(leaderboard, 1):
+                        cert_emoji = {
+                            "platinum": "🏆",
+                            "gold": "🥇",
+                            "silver": "🥈",
+                            "bronze": "🥉",
+                            "uncertified": "⚪"
+                        }.get(entry['certification_level'], "")
+
+                        st.text(f"{idx}. {cert_emoji} {entry['tool_name']} - {entry['overall_score']:.1f}/100")
+                else:
+                    st.info("No quality scores calculated yet")
+
+            except Exception as e:
+                st.error(f"Leaderboard error: {e}")
 
         st.divider()
 
