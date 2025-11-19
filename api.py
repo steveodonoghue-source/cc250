@@ -30,6 +30,8 @@ import os
 
 # Import our modules
 import database as db
+import database_marketplace as db_market
+import database_cost_optimization as db_cost
 from streamlit_app import create_team, TextMessage
 import streamlit as st
 
@@ -394,6 +396,335 @@ async def get_cost_summary(days: int = 7):
     """Get cost summary for the last N days."""
     summary = db.get_cost_summary(days=days)
     return summary
+
+
+# ============================================================================
+# Marketplace API Endpoints
+# ============================================================================
+
+# --- Pydantic Models for Marketplace ---
+
+class CategoryCreate(BaseModel):
+    """Request model for creating a category."""
+    name: str
+    description: Optional[str] = ""
+    icon: Optional[str] = ""
+
+class SkillRating(BaseModel):
+    """Request model for rating a skill."""
+    rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5")
+    review_text: Optional[str] = ""
+
+class SkillPricingUpdate(BaseModel):
+    """Request model for updating skill pricing."""
+    pricing_type: str = Field(..., description="One of: free, one_time, subscription, pay_per_use")
+    price: Optional[float] = 0.0
+    currency: Optional[str] = "USD"
+    billing_period: Optional[str] = None
+
+class SkillPackCreate(BaseModel):
+    """Request model for creating a skill pack."""
+    name: str
+    description: str
+    skill_ids: List[int]
+    pricing_type: Optional[str] = "free"
+    price: Optional[float] = 0.0
+    icon: Optional[str] = ""
+
+# Cost Optimization Models
+class BudgetConfig(BaseModel):
+    """Request model for setting budget."""
+    budget_type: str = Field(..., description="One of: daily, weekly, monthly, per_session")
+    budget_limit: float = Field(..., gt=0, description="Budget limit in USD")
+    alert_threshold: Optional[float] = Field(0.8, ge=0, le=1, description="Alert threshold (0-1)")
+
+class AgentModelConfig(BaseModel):
+    """Request model for configuring agent model."""
+    agent_name: str
+    model_name: str = Field(..., description="e.g., gemini-2.0-flash-exp or gemini-2.5-pro")
+    max_tokens: Optional[int] = 8192
+    temperature: Optional[float] = Field(0.7, ge=0, le=1)
+
+class CostTrackingRequest(BaseModel):
+    """Request model for tracking cost."""
+    session_id: str
+    agent_name: str
+    model_name: str
+    input_tokens: int
+    output_tokens: int
+
+# --- Category Endpoints ---
+
+@app.get("/api/v1/marketplace/categories")
+async def list_categories():
+    """List all skill categories."""
+    categories = db_market.list_categories()
+    return categories
+
+@app.post("/api/v1/marketplace/categories")
+async def create_category(category: CategoryCreate):
+    """Create a new skill category."""
+    category_id = db_market.create_category(
+        name=category.name,
+        description=category.description,
+        icon=category.icon
+    )
+    return {"id": category_id, "name": category.name}
+
+@app.post("/api/v1/marketplace/skills/{skill_id}/tag/{category_id}")
+async def tag_skill_with_category(skill_id: int, category_id: int):
+    """Tag a skill with a category."""
+    db_market.tag_skill(skill_id, category_id)
+    return {"status": "tagged", "skill_id": skill_id, "category_id": category_id}
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/categories")
+async def get_skill_categories(skill_id: int):
+    """Get categories for a specific skill."""
+    categories = db_market.get_skill_categories(skill_id)
+    return categories
+
+# --- Rating Endpoints ---
+
+@app.post("/api/v1/marketplace/skills/{skill_id}/rate")
+async def rate_skill(skill_id: int, rating: SkillRating, user_id: str = "default_user"):
+    """Rate a skill (1-5 stars) with optional review."""
+    rating_id = db_market.add_rating(
+        skill_id=skill_id,
+        user_id=user_id,
+        rating=rating.rating,
+        review_text=rating.review_text
+    )
+    return {"rating_id": rating_id, "status": "rated"}
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/rating")
+async def get_skill_rating(skill_id: int):
+    """Get rating summary for a skill."""
+    summary = db_market.get_skill_rating_summary(skill_id)
+    return summary
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/reviews")
+async def get_skill_reviews(skill_id: int, limit: int = 10):
+    """Get recent reviews for a skill."""
+    reviews = db_market.get_skill_reviews(skill_id, limit)
+    return reviews
+
+# --- Pricing Endpoints ---
+
+@app.post("/api/v1/marketplace/skills/{skill_id}/pricing")
+async def set_skill_pricing(skill_id: int, pricing: SkillPricingUpdate):
+    """Set or update pricing for a skill."""
+    pricing_id = db_market.set_skill_pricing(
+        skill_id=skill_id,
+        pricing_type=pricing.pricing_type,
+        price=pricing.price,
+        currency=pricing.currency,
+        billing_period=pricing.billing_period
+    )
+    return {"pricing_id": pricing_id, "status": "updated"}
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/pricing")
+async def get_skill_pricing(skill_id: int):
+    """Get current pricing for a skill."""
+    pricing = db_market.get_skill_pricing(skill_id)
+    if not pricing:
+        return {"pricing_type": "free", "price": 0.0}
+    return pricing
+
+# --- Install Tracking Endpoints ---
+
+@app.post("/api/v1/marketplace/skills/{skill_id}/install")
+async def track_skill_install(skill_id: int, user_id: str = "default_user"):
+    """Track a skill installation."""
+    db_market.track_install(skill_id, user_id)
+    return {"status": "installed", "skill_id": skill_id}
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/installs")
+async def get_install_count(skill_id: int):
+    """Get total install count for a skill."""
+    count = db_market.get_install_count(skill_id)
+    return {"skill_id": skill_id, "install_count": count}
+
+# --- Skill Pack Endpoints ---
+
+@app.post("/api/v1/marketplace/packs")
+async def create_skill_pack(pack: SkillPackCreate):
+    """Create a skill pack (bundle)."""
+    pack_id = db_market.create_skill_pack(
+        name=pack.name,
+        description=pack.description,
+        skill_ids=pack.skill_ids,
+        pricing_type=pack.pricing_type,
+        price=pack.price,
+        icon=pack.icon
+    )
+    return {"pack_id": pack_id, "name": pack.name}
+
+@app.get("/api/v1/marketplace/packs")
+async def list_skill_packs():
+    """List all skill packs."""
+    packs = db_market.list_skill_packs()
+    return packs
+
+@app.get("/api/v1/marketplace/packs/{pack_id}/skills")
+async def get_pack_skills(pack_id: int):
+    """Get all skills in a pack."""
+    skills = db_market.get_pack_skills(pack_id)
+    return skills
+
+# --- Enhanced Skill Listing ---
+
+@app.get("/api/v1/marketplace/skills")
+async def list_marketplace_skills(
+    limit: int = 100,
+    category_id: Optional[int] = None,
+    min_rating: Optional[float] = None
+):
+    """List skills with marketplace metadata (ratings, installs, pricing)."""
+    skills = db_market.list_skills_with_marketplace_data(
+        limit=limit,
+        category_id=category_id,
+        min_rating=min_rating
+    )
+    return skills
+
+# --- Dependency Endpoints ---
+
+@app.post("/api/v1/marketplace/skills/{skill_id}/dependencies/{depends_on_skill_id}")
+async def add_skill_dependency(
+    skill_id: int,
+    depends_on_skill_id: int,
+    min_version: Optional[str] = None,
+    max_version: Optional[str] = None,
+    is_required: bool = True
+):
+    """Add a dependency between skills."""
+    db_market.add_dependency(
+        skill_id=skill_id,
+        depends_on_skill_id=depends_on_skill_id,
+        min_version=min_version,
+        max_version=max_version,
+        is_required=is_required
+    )
+    return {"status": "dependency_added"}
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/dependencies")
+async def get_skill_dependencies(skill_id: int):
+    """Get dependencies for a skill."""
+    deps = db_market.get_skill_dependencies(skill_id)
+    return deps
+
+# --- Version Endpoints ---
+
+@app.get("/api/v1/marketplace/skills/{skill_id}/versions")
+async def get_skill_versions(skill_id: int):
+    """Get all versions of a skill."""
+    versions = db_market.get_skill_versions(skill_id)
+    return versions
+
+
+# ============================================================================
+# Cost Optimization Endpoints
+# ============================================================================
+
+# --- Budget Management ---
+
+@app.post("/api/v1/cost/budget")
+async def set_budget(config: BudgetConfig):
+    """Set a budget configuration."""
+    budget_id = db_cost.set_budget(
+        budget_type=config.budget_type,
+        budget_limit=config.budget_limit,
+        alert_threshold=config.alert_threshold
+    )
+    return {"budget_id": budget_id, "status": "budget_set"}
+
+@app.get("/api/v1/cost/budget/{budget_type}")
+async def get_budget(budget_type: str):
+    """Get active budget configuration."""
+    budget = db_cost.get_active_budget(budget_type)
+    if budget:
+        return budget
+    return {"message": f"No active budget found for type: {budget_type}"}
+
+# --- Agent Model Configuration ---
+
+@app.post("/api/v1/cost/agents/config")
+async def configure_agent_model(config: AgentModelConfig):
+    """Configure which model an agent should use."""
+    config_id = db_cost.set_agent_model(
+        agent_name=config.agent_name,
+        model_name=config.model_name,
+        max_tokens=config.max_tokens,
+        temperature=config.temperature
+    )
+    return {"config_id": config_id, "status": "agent_configured"}
+
+@app.get("/api/v1/cost/agents/config/{agent_name}")
+async def get_agent_config(agent_name: str):
+    """Get model configuration for an agent."""
+    config = db_cost.get_agent_model_config(agent_name)
+    if config:
+        return config
+    return {"message": f"No configuration found for agent: {agent_name}"}
+
+@app.get("/api/v1/cost/agents/configs")
+async def list_agent_configs():
+    """List all agent model configurations."""
+    configs = db_cost.list_agent_configs()
+    return configs
+
+# --- Cost Tracking ---
+
+@app.post("/api/v1/cost/track")
+async def track_cost(request: CostTrackingRequest):
+    """Track cost for an API call."""
+    tracking_id, estimated_cost = db_cost.track_cost(
+        session_id=request.session_id,
+        agent_name=request.agent_name,
+        model_name=request.model_name,
+        input_tokens=request.input_tokens,
+        output_tokens=request.output_tokens
+    )
+    return {
+        "tracking_id": tracking_id,
+        "estimated_cost": estimated_cost,
+        "status": "tracked"
+    }
+
+@app.get("/api/v1/cost/session/{session_id}/summary")
+async def get_session_cost_summary(session_id: str):
+    """Get cost summary for a session."""
+    summary = db_cost.get_session_cost_summary(session_id)
+    return summary
+
+@app.get("/api/v1/cost/analytics")
+async def get_cost_analytics(days: int = 7):
+    """Get cost analytics for the last N days."""
+    analytics = db_cost.get_cost_analytics(days=days)
+    return analytics
+
+# --- Alerts ---
+
+@app.get("/api/v1/cost/alerts")
+async def get_alerts(session_id: Optional[str] = None):
+    """Get unacknowledged cost alerts."""
+    alerts = db_cost.get_unacknowledged_alerts(session_id)
+    return alerts
+
+@app.post("/api/v1/cost/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(alert_id: int):
+    """Acknowledge a cost alert."""
+    db_cost.acknowledge_alert(alert_id)
+    return {"status": "acknowledged"}
+
+# --- Cache Stats ---
+
+@app.get("/api/v1/cost/cache/stats")
+async def get_cache_stats():
+    """Get cache performance statistics."""
+    stats = db_cost.get_cache_stats()
+    return stats
+
 
 # ============================================================================
 # Main

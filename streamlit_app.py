@@ -27,6 +27,8 @@ from pydantic import BaseModel, Field, ValidationError
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import SelectorGroupChat
 import database as db
+import database_marketplace as db_market
+import database_cost_optimization as db_cost
 from autogen_agentchat.messages import (
     ChatMessage,
     TextMessage,
@@ -2322,186 +2324,649 @@ def render_sidebar():
 
         st.divider()
 
-        # Skill Library Browser (NEW Feature #6)
-        st.markdown("### 🧠 Skill Library")
+        # Skill Library Browser (Feature #6 - Enhanced with Marketplace)
+        st.markdown("### 🧠 Skill Marketplace")
 
-        # Get all skills from database
-        try:
-            all_skills = db.list_skills(active_only=True, limit=100)
+        # Tab selection for Skills vs Skill Packs
+        marketplace_tab1, marketplace_tab2 = st.tabs(["📦 Skills", "🎁 Skill Packs"])
 
-            # Search/filter bar
-            search_term = st.text_input(
-                "🔍 Search Skills",
-                placeholder="Search by name or description...",
-                key="skill_search"
-            )
+        with marketplace_tab1:
+            # Get all skills from marketplace database (with ratings, pricing, installs)
+            try:
+                # Get categories for filter
+                all_categories = db_market.list_categories()
 
-            # Filter skills by search term
-            if search_term:
-                filtered_skills = [
-                    s for s in all_skills
-                    if search_term.lower() in s['tool_name'].lower()
-                    or search_term.lower() in s['description'].lower()
-                ]
-            else:
-                filtered_skills = all_skills
-
-            # Display skill count
-            st.caption(f"📚 {len(filtered_skills)} skills available")
-
-            # Display skills
-            if filtered_skills:
-                # Sort options
-                sort_by = st.selectbox(
-                    "Sort by",
-                    ["Name", "Usage Count", "Date Added"],
-                    key="skill_sort"
+                # Category filter
+                category_options = ["All Categories"] + [cat['name'] for cat in all_categories]
+                selected_category = st.selectbox(
+                    "🏷️ Filter by Category",
+                    category_options,
+                    key="category_filter"
                 )
 
-                # Sort skills
-                if sort_by == "Usage Count":
-                    sorted_skills = sorted(filtered_skills, key=lambda x: x.get('usage_count', 0), reverse=True)
-                elif sort_by == "Date Added":
-                    sorted_skills = sorted(filtered_skills, key=lambda x: x.get('created_at', ''), reverse=True)
-                else:  # Name
-                    sorted_skills = sorted(filtered_skills, key=lambda x: x['tool_name'])
+                # Get category ID if selected
+                category_id = None
+                if selected_category != "All Categories":
+                    category_id = next((cat['id'] for cat in all_categories if cat['name'] == selected_category), None)
 
-                # Display top skills in cards
-                with st.expander(f"📦 Browse Skills ({len(sorted_skills)})", expanded=True):
-                    for skill in sorted_skills[:20]:  # Show top 20
+                # Search/filter bar
+                search_term = st.text_input(
+                    "🔍 Search Skills",
+                    placeholder="Search by name or description...",
+                    key="skill_search"
+                )
+
+                # Get skills with marketplace data
+                all_skills = db_market.list_skills_with_marketplace_data(
+                    limit=100,
+                    category_id=category_id
+                )
+
+                # Filter skills by search term
+                if search_term:
+                    filtered_skills = [
+                        s for s in all_skills
+                        if search_term.lower() in s['tool_name'].lower()
+                        or search_term.lower() in s['description'].lower()
+                    ]
+                else:
+                    filtered_skills = all_skills
+
+                # Display skill count
+                st.caption(f"📚 {len(filtered_skills)} skills available")
+
+                # Display skills
+                if filtered_skills:
+                    # Sort options
+                    sort_by = st.selectbox(
+                        "Sort by",
+                        ["Rating", "Installs", "Name", "Usage Count", "Date Added"],
+                        key="skill_sort"
+                    )
+
+                    # Sort skills
+                    if sort_by == "Rating":
+                        sorted_skills = sorted(filtered_skills, key=lambda x: x.get('average_rating', 0), reverse=True)
+                    elif sort_by == "Installs":
+                        sorted_skills = sorted(filtered_skills, key=lambda x: x.get('install_count', 0), reverse=True)
+                    elif sort_by == "Usage Count":
+                        sorted_skills = sorted(filtered_skills, key=lambda x: x.get('usage_count', 0), reverse=True)
+                    elif sort_by == "Date Added":
+                        sorted_skills = sorted(filtered_skills, key=lambda x: x.get('created_at', ''), reverse=True)
+                    else:  # Name
+                        sorted_skills = sorted(filtered_skills, key=lambda x: x['tool_name'])
+
+                    # Display top skills in cards
+                    with st.expander(f"📦 Browse Skills ({len(sorted_skills)})", expanded=True):
+                        for skill in sorted_skills[:20]:  # Show top 20
+                            with st.container():
+                                # Skill header with marketplace badges
+                                col1, col2, col3, col4 = st.columns([3, 1, 1, 0.5])
+
+                                with col1:
+                                    st.markdown(f"**{skill['tool_name']}**")
+                                    st.caption(skill['description'][:60] + "..." if len(skill['description']) > 60 else skill['description'])
+
+                                with col2:
+                                    # Rating display
+                                    avg_rating = skill.get('average_rating', 0)
+                                    review_count = skill.get('review_count', 0)
+                                    if avg_rating > 0:
+                                        stars = "⭐" * int(round(avg_rating))
+                                        st.caption(f"{stars} {avg_rating:.1f} ({review_count})")
+                                    else:
+                                        st.caption("No ratings yet")
+
+                                with col3:
+                                    # Install count and pricing
+                                    install_count = skill.get('install_count', 0)
+                                    pricing_type = skill.get('pricing_type', 'free')
+                                    price = skill.get('price', 0.0)
+
+                                    st.caption(f"📥 {install_count} installs")
+                                    if pricing_type == 'free' or not pricing_type:
+                                        st.caption("💚 FREE")
+                                    else:
+                                        st.caption(f"💰 ${price:.2f}")
+
+                                with col4:
+                                    # Quick actions
+                                    if st.button("👁️", key=f"view_{skill['id']}", help="View details"):
+                                        st.session_state[f"view_skill_{skill['id']}"] = True
+
+                                # Expanded details (if view button clicked)
+                                if st.session_state.get(f"view_skill_{skill['id']}", False):
+                                    st.markdown("**Description:**")
+                                    st.text(skill['description'])
+
+                                    # Marketplace metadata row
+                                    meta_col1, meta_col2, meta_col3 = st.columns(3)
+                                    with meta_col1:
+                                        st.metric("Installs", skill.get('install_count', 0))
+                                    with meta_col2:
+                                        st.metric("Usage", skill.get('usage_count', 0))
+                                    with meta_col3:
+                                        avg_rating = skill.get('average_rating', 0)
+                                        st.metric("Rating", f"{avg_rating:.1f}⭐" if avg_rating > 0 else "N/A")
+
+                                    # Rating & Reviews Section
+                                    with st.expander("⭐ Ratings & Reviews", expanded=False):
+                                        # Get rating summary
+                                        rating_summary = db_market.get_skill_rating_summary(skill['id'])
+
+                                        if rating_summary['review_count'] > 0:
+                                            # Star distribution
+                                            st.markdown("**Rating Distribution:**")
+                                            total_reviews = rating_summary['review_count']
+                                            for star in [5, 4, 3, 2, 1]:
+                                                count = rating_summary.get(f'{["", "one", "two", "three", "four", "five"][star]}_star', 0)
+                                                percentage = (count / total_reviews * 100) if total_reviews > 0 else 0
+                                                st.progress(percentage / 100, text=f"{star}⭐ ({count})")
+
+                                            st.markdown("---")
+
+                                            # Display reviews
+                                            st.markdown("**Recent Reviews:**")
+                                            reviews = db_market.get_skill_reviews(skill['id'], limit=5)
+                                            for review in reviews:
+                                                stars = "⭐" * review['rating']
+                                                st.text(f"{stars} - {review['user_id']}")
+                                                if review.get('review_text'):
+                                                    st.caption(review['review_text'])
+                                                st.caption(f"Posted: {review['created_at'][:10]}")
+                                                st.markdown("---")
+                                        else:
+                                            st.info("No reviews yet. Be the first to rate this skill!")
+
+                                        # Add rating form
+                                        st.markdown("**Rate this skill:**")
+                                        rating_value = st.slider(
+                                            "Your rating",
+                                            min_value=1,
+                                            max_value=5,
+                                            value=5,
+                                            key=f"rating_slider_{skill['id']}"
+                                        )
+                                        review_text = st.text_area(
+                                            "Your review (optional)",
+                                            placeholder="Share your experience with this skill...",
+                                            key=f"review_text_{skill['id']}"
+                                        )
+                                        if st.button("Submit Rating", key=f"submit_rating_{skill['id']}"):
+                                            try:
+                                                user_id = st.session_state.get('user_id', 'streamlit_user')
+                                                db_market.add_rating(
+                                                    skill_id=skill['id'],
+                                                    user_id=user_id,
+                                                    rating=rating_value,
+                                                    review_text=review_text
+                                                )
+                                                st.success("✅ Rating submitted!")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Failed to submit rating: {e}")
+
+                                    st.markdown("**Parameters:**")
+                                    params = skill.get('parameters', {})
+                                    if params:
+                                        for param, ptype in params.items():
+                                            st.text(f"  • {param}: {ptype}")
+                                    else:
+                                        st.text("  No parameters")
+
+                                    # Code preview
+                                    with st.expander("💻 View Code"):
+                                        st.code(skill['code'], language='python')
+
+                                    # Safety notes
+                                    if skill.get('safety_notes'):
+                                        with st.expander("⚠️ Safety Notes"):
+                                            for note in skill['safety_notes']:
+                                                st.text(f"• {note}")
+
+                                    # Metadata
+                                    st.caption(f"Created: {skill.get('created_at', 'Unknown')[:10]}")
+
+                                    # Action buttons
+                                    col_act1, col_act2, col_act3 = st.columns(3)
+
+                                    with col_act1:
+                                        # Export skill as JSON
+                                        skill_json = {
+                                            "tool_name": skill['tool_name'],
+                                            "description": skill['description'],
+                                            "parameters": skill['parameters'],
+                                            "code": skill['code'],
+                                            "safety_notes": skill['safety_notes']
+                                        }
+                                        st.download_button(
+                                            "📥 Export",
+                                            data=str(skill_json),
+                                            file_name=f"{skill['tool_name']}.json",
+                                            mime="application/json",
+                                            key=f"export_{skill['id']}",
+                                            help="Export skill for sharing"
+                                        )
+
+                                    with col_act2:
+                                        # Copy to clipboard (show code)
+                                        if st.button("📋 Copy", key=f"copy_{skill['id']}", help="Copy code"):
+                                            st.code(skill['code'], language='python')
+                                            st.success("Code displayed above!")
+
+                                    with col_act3:
+                                        # Delete skill
+                                        if st.button("🗑️ Delete", key=f"delete_{skill['id']}", help="Delete skill"):
+                                            try:
+                                                db.delete_skill(skill['tool_name'])
+                                                st.success(f"Deleted: {skill['tool_name']}")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Delete failed: {e}")
+
+                                    # Close button
+                                    if st.button("✖️ Close", key=f"close_{skill['id']}"):
+                                        st.session_state[f"view_skill_{skill['id']}"] = False
+                                        st.rerun()
+
+                                st.markdown("---")
+
+                else:
+                    st.info("No skills found. Agents will generate skills dynamically as needed.")
+
+                # Quick actions
+                st.markdown("**Quick Actions:**")
+                col_qa1, col_qa2 = st.columns(2)
+
+                with col_qa1:
+                    # Import skill from JSON
+                    uploaded_skill = st.file_uploader(
+                        "📤 Import Skill",
+                        type=['json'],
+                        key="import_skill",
+                        help="Import a skill from JSON file"
+                    )
+
+                    if uploaded_skill:
+                        try:
+                            import json
+                            skill_data = json.load(uploaded_skill)
+
+                            # Validate required fields
+                            required = ['tool_name', 'description', 'code', 'parameters', 'safety_notes']
+                            if all(k in skill_data for k in required):
+                                # Save to database
+                                db.save_skill(
+                                    tool_name=skill_data['tool_name'],
+                                    description=skill_data['description'],
+                                    code=skill_data['code'],
+                                    parameters=skill_data['parameters'],
+                                    safety_notes=skill_data['safety_notes']
+                                )
+                                st.success(f"✅ Imported: {skill_data['tool_name']}")
+                                st.rerun()
+                            else:
+                                st.error("Invalid skill format. Missing required fields.")
+                        except Exception as e:
+                            st.error(f"Import failed: {e}")
+
+                with col_qa2:
+                    # Refresh skills list
+                    if st.button("🔄 Refresh", use_container_width=True, help="Reload skills from database"):
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"Skill library error: {e}")
+                st.caption("Skills can be viewed once generated by SkillGenerator agent")
+
+        # Skill Packs Tab
+        with marketplace_tab2:
+            try:
+                st.markdown("#### 🎁 Skill Packs - Curated Bundles")
+                st.caption("Pre-configured skill bundles for common tasks")
+
+                # Get all skill packs
+                all_packs = db_market.list_skill_packs()
+
+                if all_packs:
+                    for pack in all_packs:
                         with st.container():
-                            # Skill header
-                            col1, col2, col3 = st.columns([3, 1, 1])
+                            # Pack header
+                            pack_col1, pack_col2, pack_col3 = st.columns([3, 1, 1])
 
-                            with col1:
-                                st.markdown(f"**{skill['tool_name']}**")
-                                st.caption(skill['description'][:60] + "..." if len(skill['description']) > 60 else skill['description'])
+                            with pack_col1:
+                                icon = pack.get('icon', '📦')
+                                st.markdown(f"{icon} **{pack['name']}**")
+                                st.caption(pack['description'][:80] + "..." if len(pack['description']) > 80 else pack['description'])
 
-                            with col2:
-                                st.caption(f"📊 {skill.get('usage_count', 0)} uses")
-
-                            with col3:
-                                # Quick actions
-                                if st.button("👁️", key=f"view_{skill['id']}", help="View details"):
-                                    st.session_state[f"view_skill_{skill['id']}"] = True
-
-                            # Expanded details (if view button clicked)
-                            if st.session_state.get(f"view_skill_{skill['id']}", False):
-                                st.markdown("**Description:**")
-                                st.text(skill['description'])
-
-                                st.markdown("**Parameters:**")
-                                params = skill.get('parameters', {})
-                                if params:
-                                    for param, ptype in params.items():
-                                        st.text(f"  • {param}: {ptype}")
+                            with pack_col2:
+                                # Pricing
+                                pricing_type = pack.get('pricing_type', 'free')
+                                price = pack.get('price', 0.0)
+                                if pricing_type == 'free':
+                                    st.caption("💚 FREE")
                                 else:
-                                    st.text("  No parameters")
+                                    st.caption(f"💰 ${price:.2f}")
 
-                                # Code preview
-                                with st.expander("💻 View Code"):
-                                    st.code(skill['code'], language='python')
+                            with pack_col3:
+                                # View pack button
+                                if st.button("👁️", key=f"view_pack_{pack['id']}", help="View pack details"):
+                                    st.session_state[f"view_pack_{pack['id']}"] = True
 
-                                # Safety notes
-                                if skill.get('safety_notes'):
-                                    with st.expander("⚠️ Safety Notes"):
-                                        for note in skill['safety_notes']:
-                                            st.text(f"• {note}")
+                            # Expanded pack details
+                            if st.session_state.get(f"view_pack_{pack['id']}", False):
+                                st.markdown("**Description:**")
+                                st.text(pack['description'])
 
-                                # Metadata
-                                st.caption(f"Created: {skill.get('created_at', 'Unknown')[:10]}")
+                                # Get skills in this pack
+                                pack_skills = db_market.get_skill_pack_skills(pack['id'])
+
+                                st.markdown(f"**Included Skills ({len(pack_skills)}):**")
+                                for skill in pack_skills:
+                                    st.text(f"  • {skill['tool_name']} - {skill['description'][:50]}...")
 
                                 # Action buttons
-                                col_act1, col_act2, col_act3 = st.columns(3)
+                                pack_act_col1, pack_act_col2 = st.columns(2)
 
-                                with col_act1:
-                                    # Export skill as JSON
-                                    skill_json = {
-                                        "tool_name": skill['tool_name'],
-                                        "description": skill['description'],
-                                        "parameters": skill['parameters'],
-                                        "code": skill['code'],
-                                        "safety_notes": skill['safety_notes']
-                                    }
-                                    st.download_button(
-                                        "📥 Export",
-                                        data=str(skill_json),
-                                        file_name=f"{skill['tool_name']}.json",
-                                        mime="application/json",
-                                        key=f"export_{skill['id']}",
-                                        help="Export skill for sharing"
-                                    )
-
-                                with col_act2:
-                                    # Copy to clipboard (show code)
-                                    if st.button("📋 Copy", key=f"copy_{skill['id']}", help="Copy code"):
-                                        st.code(skill['code'], language='python')
-                                        st.success("Code displayed above!")
-
-                                with col_act3:
-                                    # Delete skill
-                                    if st.button("🗑️ Delete", key=f"delete_{skill['id']}", help="Delete skill"):
+                                with pack_act_col1:
+                                    if st.button("📥 Install Pack", key=f"install_pack_{pack['id']}", use_container_width=True):
                                         try:
-                                            db.delete_skill(skill['tool_name'])
-                                            st.success(f"Deleted: {skill['tool_name']}")
+                                            # Track install for each skill in pack
+                                            for skill in pack_skills:
+                                                db_market.track_install(skill['id'], user_id='streamlit_user')
+                                            st.success(f"✅ Installed {len(pack_skills)} skills from {pack['name']}")
                                             st.rerun()
                                         except Exception as e:
-                                            st.error(f"Delete failed: {e}")
+                                            st.error(f"Installation failed: {e}")
 
-                                # Close button
-                                if st.button("✖️ Close", key=f"close_{skill['id']}"):
-                                    st.session_state[f"view_skill_{skill['id']}"] = False
-                                    st.rerun()
+                                with pack_act_col2:
+                                    if st.button("✖️ Close", key=f"close_pack_{pack['id']}", use_container_width=True):
+                                        st.session_state[f"view_pack_{pack['id']}"] = False
+                                        st.rerun()
+
+                                st.markdown("---")
 
                             st.markdown("---")
 
-            else:
-                st.info("No skills found. Agents will generate skills dynamically as needed.")
+                else:
+                    st.info("No skill packs available yet. Check back soon!")
 
-            # Quick actions
-            st.markdown("**Quick Actions:**")
-            col_qa1, col_qa2 = st.columns(2)
+                # Create custom pack section
+                with st.expander("➕ Create Custom Pack"):
+                    pack_name = st.text_input("Pack Name", key="new_pack_name")
+                    pack_desc = st.text_area("Pack Description", key="new_pack_desc")
+                    pack_icon = st.text_input("Icon (emoji)", value="📦", key="new_pack_icon")
 
-            with col_qa1:
-                # Import skill from JSON
-                uploaded_skill = st.file_uploader(
-                    "📤 Import Skill",
-                    type=['json'],
-                    key="import_skill",
-                    help="Import a skill from JSON file"
-                )
+                    # Skill selection
+                    all_skills_for_pack = db.list_skills(active_only=True, limit=100)
+                    skill_options = {s['tool_name']: s['id'] for s in all_skills_for_pack}
 
-                if uploaded_skill:
-                    try:
-                        import json
-                        skill_data = json.load(uploaded_skill)
+                    selected_skills = st.multiselect(
+                        "Select Skills for Pack",
+                        options=list(skill_options.keys()),
+                        key="pack_skills_select"
+                    )
 
-                        # Validate required fields
-                        required = ['tool_name', 'description', 'code', 'parameters', 'safety_notes']
-                        if all(k in skill_data for k in required):
-                            # Save to database
-                            db.save_skill(
-                                tool_name=skill_data['tool_name'],
-                                description=skill_data['description'],
-                                code=skill_data['code'],
-                                parameters=skill_data['parameters'],
-                                safety_notes=skill_data['safety_notes']
-                            )
-                            st.success(f"✅ Imported: {skill_data['tool_name']}")
-                            st.rerun()
+                    # Pricing
+                    pack_pricing = st.radio("Pricing Type", ["free", "paid"], key="pack_pricing")
+                    pack_price = 0.0
+                    if pack_pricing == "paid":
+                        pack_price = st.number_input("Price ($)", min_value=0.0, value=9.99, key="pack_price")
+
+                    if st.button("Create Pack", key="create_pack_btn"):
+                        if pack_name and pack_desc and selected_skills:
+                            try:
+                                skill_ids = [skill_options[name] for name in selected_skills]
+                                pack_id = db_market.create_skill_pack(
+                                    name=pack_name,
+                                    description=pack_desc,
+                                    skill_ids=skill_ids,
+                                    pricing_type=pack_pricing,
+                                    price=pack_price,
+                                    icon=pack_icon
+                                )
+                                st.success(f"✅ Created pack: {pack_name} (ID: {pack_id})")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to create pack: {e}")
                         else:
-                            st.error("Invalid skill format. Missing required fields.")
+                            st.warning("Please fill in all fields and select at least one skill")
+
+            except Exception as e:
+                st.error(f"Skill packs error: {e}")
+
+        st.divider()
+
+        # Cost Optimization (Feature #2)
+        st.markdown("### 💰 Cost Optimization")
+
+        # Create tabs for different cost features
+        cost_tab1, cost_tab2, cost_tab3 = st.tabs(["💵 Budget", "⚙️ Agents", "📊 Analytics"])
+
+        with cost_tab1:
+            st.markdown("#### Budget Management")
+
+            # Get current session ID
+            current_session_id = st.session_state.get('session_id', 'default_session')
+
+            # Set session budget
+            with st.expander("➕ Set Session Budget"):
+                session_budget = st.number_input(
+                    "Session Budget ($)",
+                    min_value=0.0,
+                    value=10.0,
+                    step=1.0,
+                    key="session_budget_input"
+                )
+                alert_threshold = st.slider(
+                    "Alert Threshold (%)",
+                    min_value=0,
+                    max_value=100,
+                    value=80,
+                    key="alert_threshold_input"
+                )
+                if st.button("Set Budget", key="set_budget_btn"):
+                    try:
+                        budget_id = db_cost.set_budget(
+                            budget_type='per_session',
+                            budget_limit=session_budget,
+                            alert_threshold=alert_threshold / 100
+                        )
+                        st.success(f"✅ Budget set: ${session_budget:.2f}")
                     except Exception as e:
-                        st.error(f"Import failed: {e}")
+                        st.error(f"Failed to set budget: {e}")
 
-            with col_qa2:
-                # Refresh skills list
-                if st.button("🔄 Refresh", use_container_width=True, help="Reload skills from database"):
-                    st.rerun()
+            # Display current session cost
+            try:
+                cost_summary = db_cost.get_session_cost_summary(current_session_id)
 
-        except Exception as e:
-            st.error(f"Skill library error: {e}")
-            st.caption("Skills can be viewed once generated by SkillGenerator agent")
+                # Main cost metrics
+                col_cost1, col_cost2 = st.columns(2)
+                with col_cost1:
+                    total_cost = cost_summary.get('total_cost', 0.0)
+                    st.metric("Total Cost", f"${total_cost:.4f}")
+
+                with col_cost2:
+                    call_count = cost_summary.get('call_count', 0)
+                    st.metric("API Calls", call_count)
+
+                # Budget status
+                budget_info = cost_summary.get('budget_info')
+                if budget_info:
+                    budget_limit = budget_info['budget_limit']
+                    current_spend = budget_info['current_spend']
+                    percentage_used = budget_info['percentage_used']
+
+                    st.progress(
+                        min(percentage_used / 100, 1.0),
+                        text=f"Budget Used: {percentage_used:.1f}% (${current_spend:.4f} / ${budget_limit:.2f})"
+                    )
+
+                    if budget_info['budget_exceeded']:
+                        st.error("⚠️ Budget exceeded!")
+                else:
+                    st.info("No budget set for this session")
+
+                # Token usage breakdown
+                st.markdown("**Token Usage:**")
+                token_col1, token_col2 = st.columns(2)
+                with token_col1:
+                    st.caption(f"Input: {cost_summary.get('total_input_tokens', 0):,}")
+                with token_col2:
+                    st.caption(f"Output: {cost_summary.get('total_output_tokens', 0):,}")
+
+            except Exception as e:
+                st.error(f"Cost tracking error: {e}")
+
+            # Cost alerts
+            try:
+                alerts = db_cost.get_unacknowledged_alerts(current_session_id)
+                if alerts:
+                    st.markdown("**⚠️ Active Alerts:**")
+                    for alert in alerts[:3]:  # Show top 3
+                        alert_type = alert['alert_type']
+                        message = alert['message']
+                        alert_id = alert['id']
+
+                        alert_container = st.container()
+                        with alert_container:
+                            alert_col1, alert_col2 = st.columns([4, 1])
+                            with alert_col1:
+                                if alert_type == 'budget_exceeded':
+                                    st.error(message)
+                                else:
+                                    st.warning(message)
+                            with alert_col2:
+                                if st.button("✓", key=f"ack_alert_{alert_id}", help="Acknowledge"):
+                                    db_cost.acknowledge_alert(alert_id)
+                                    st.rerun()
+            except Exception as e:
+                st.caption(f"Alert check error: {e}")
+
+        with cost_tab2:
+            st.markdown("#### Agent Model Configuration")
+            st.caption("Configure which model each agent uses")
+
+            try:
+                # Get current agent configurations
+                agent_configs = db_cost.list_agent_configs()
+
+                # Display current configurations
+                st.markdown("**Current Configuration:**")
+                for config in agent_configs:
+                    agent_name = config['agent_name']
+                    model_name = config['model_name']
+                    max_tokens = config['max_tokens']
+                    temperature = config['temperature']
+
+                    with st.expander(f"{agent_name} - {model_name}"):
+                        st.text(f"Model: {model_name}")
+                        st.text(f"Max Tokens: {max_tokens}")
+                        st.text(f"Temperature: {temperature}")
+
+                        # Edit configuration
+                        new_model = st.selectbox(
+                            "Model",
+                            ["gemini-2.0-flash-exp", "gemini-2.5-pro"],
+                            index=0 if "flash" in model_name.lower() else 1,
+                            key=f"model_{agent_name}"
+                        )
+                        new_max_tokens = st.number_input(
+                            "Max Tokens",
+                            min_value=1024,
+                            max_value=32768,
+                            value=max_tokens,
+                            step=1024,
+                            key=f"max_tokens_{agent_name}"
+                        )
+                        new_temperature = st.slider(
+                            "Temperature",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=float(temperature),
+                            step=0.1,
+                            key=f"temp_{agent_name}"
+                        )
+
+                        if st.button("Update", key=f"update_{agent_name}"):
+                            try:
+                                db_cost.set_agent_model(
+                                    agent_name=agent_name,
+                                    model_name=new_model,
+                                    max_tokens=new_max_tokens,
+                                    temperature=new_temperature
+                                )
+                                st.success(f"✅ Updated {agent_name}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Update failed: {e}")
+
+                # Model pricing info
+                st.markdown("**Model Pricing:**")
+                st.caption("💚 gemini-2.0-flash-exp: FREE (experimental)")
+                st.caption("💚 gemini-2.5-pro: FREE (experimental)")
+                st.caption("⚠️ Pricing may change when models go to production")
+
+            except Exception as e:
+                st.error(f"Agent config error: {e}")
+
+        with cost_tab3:
+            st.markdown("#### Cost Analytics")
+
+            # Time period selector
+            days = st.selectbox(
+                "Time Period",
+                [1, 7, 14, 30],
+                index=1,
+                format_func=lambda x: f"Last {x} day{'s' if x > 1 else ''}",
+                key="analytics_days"
+            )
+
+            try:
+                analytics = db_cost.get_cost_analytics(days=days)
+
+                # Total metrics
+                st.markdown(f"**Last {days} Day{'s' if days > 1 else ''}:**")
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+                with metric_col1:
+                    st.metric("Total Cost", f"${analytics['total_cost']:.4f}")
+                with metric_col2:
+                    st.metric("Total Calls", f"{analytics['total_calls']:,}")
+                with metric_col3:
+                    st.metric("Total Tokens", f"{analytics['total_tokens']:,}")
+
+                # Cost by agent
+                if analytics['by_agent']:
+                    st.markdown("**Cost by Agent:**")
+                    for agent_stat in analytics['by_agent']:
+                        agent_name = agent_stat['agent_name']
+                        cost = agent_stat['cost']
+                        calls = agent_stat['calls']
+                        tokens = agent_stat['tokens']
+
+                        st.text(f"{agent_name}: ${cost:.4f} ({calls} calls, {tokens:,} tokens)")
+
+                # Cost by model
+                if analytics['by_model']:
+                    st.markdown("**Cost by Model:**")
+                    for model_stat in analytics['by_model']:
+                        model_name = model_stat['model_name']
+                        cost = model_stat['cost']
+                        calls = model_stat['calls']
+
+                        st.text(f"{model_name}: ${cost:.4f} ({calls} calls)")
+
+                # Cache statistics
+                cache_stats = db_cost.get_cache_stats()
+                if cache_stats['total_entries'] > 0:
+                    st.markdown("**Cache Performance:**")
+                    st.text(f"Cached Responses: {cache_stats['total_entries']}")
+                    st.text(f"Cache Hits: {cache_stats['total_hits']}")
+                    st.text(f"Tokens Saved: {cache_stats['total_tokens_saved']:,}")
+
+            except Exception as e:
+                st.error(f"Analytics error: {e}")
 
         st.divider()
 
