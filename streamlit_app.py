@@ -26,6 +26,7 @@ import streamlit as st
 from pydantic import BaseModel, Field, ValidationError
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import SelectorGroupChat
+import database as db
 from autogen_agentchat.messages import (
     ChatMessage,
     TextMessage,
@@ -1829,6 +1830,87 @@ def render_sidebar():
 
         st.divider()
 
+        # Conversation Management Section
+        st.markdown("### 💾 Conversations")
+
+        # Save current conversation
+        if st.session_state.messages and st.button("💾 Save Current Session", use_container_width=True):
+            try:
+                # Generate session ID if not exists
+                if "current_session_id" not in st.session_state:
+                    st.session_state.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                # Generate title from first message
+                first_msg = next((m for m in st.session_state.messages if m['role'] == 'user'), None)
+                title = first_msg['content'][:50] + "..." if first_msg else "Untitled Session"
+
+                db.save_conversation(
+                    session_id=st.session_state.current_session_id,
+                    title=title,
+                    messages=st.session_state.messages,
+                    cost_tracking=st.session_state.cost_tracking
+                )
+                st.success(f"✅ Saved: {title}")
+            except Exception as e:
+                st.error(f"Error saving: {e}")
+
+        # List recent conversations
+        conversations = db.list_conversations(limit=10)
+
+        if conversations:
+            st.markdown("**Recent Sessions:**")
+            for conv in conversations[:5]:  # Show top 5
+                col1, col2, col3 = st.columns([3, 1, 1])
+
+                with col1:
+                    # Load button
+                    if st.button(
+                        f"{conv['title'][:30]}...",
+                        key=f"load_{conv['session_id']}",
+                        help=f"{conv['message_count']} msgs, ${conv['total_cost']:.3f}"
+                    ):
+                        try:
+                            loaded = db.load_conversation(conv['session_id'])
+                            if loaded:
+                                st.session_state.messages = loaded['messages']
+                                st.session_state.current_session_id = conv['session_id']
+                                # Restore cost if available
+                                if 'total_cost' in loaded:
+                                    st.session_state.cost_tracking['total_cost'] = loaded['total_cost']
+                                st.success(f"✅ Loaded: {conv['title'][:20]}...")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error loading: {e}")
+
+                with col2:
+                    # Export button
+                    if st.button("📤", key=f"export_{conv['session_id']}", help="Export as Markdown"):
+                        md_content = db.export_conversation_markdown(conv['session_id'])
+                        st.download_button(
+                            "⬇️ Download MD",
+                            md_content,
+                            file_name=f"{conv['session_id']}.md",
+                            mime="text/markdown",
+                            key=f"download_{conv['session_id']}"
+                        )
+
+                with col3:
+                    # Delete button
+                    if st.button("🗑️", key=f"del_{conv['session_id']}", help="Delete conversation"):
+                        db.delete_conversation(conv['session_id'])
+                        st.rerun()
+
+        else:
+            st.info("No saved conversations yet")
+
+        # View all conversations
+        if len(conversations) > 5:
+            with st.expander(f"📚 All Conversations ({len(conversations)})"):
+                for conv in conversations[5:]:
+                    st.text(f"• {conv['title'][:40]} ({conv['message_count']} msgs)")
+
+        st.divider()
+
         # Cost Monitoring Section
         st.markdown("### 💰 Cost Monitoring")
 
@@ -2136,6 +2218,25 @@ async def run_team(task: str):
         })
 
     finally:
+        # Auto-save conversation after each interaction
+        try:
+            if st.session_state.messages:
+                if "current_session_id" not in st.session_state:
+                    st.session_state.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                first_msg = next((m for m in st.session_state.messages if m['role'] == 'user'), None)
+                title = first_msg['content'][:50] + "..." if first_msg else "Untitled Session"
+
+                db.save_conversation(
+                    session_id=st.session_state.current_session_id,
+                    title=title,
+                    messages=st.session_state.messages,
+                    cost_tracking=st.session_state.cost_tracking
+                )
+                logger.info(f"Auto-saved conversation: {st.session_state.current_session_id}")
+        except Exception as save_error:
+            logger.error(f"Auto-save failed: {save_error}")
+
         st.rerun()
 
 
