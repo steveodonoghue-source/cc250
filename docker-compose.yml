@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  autogen-app:
+    build: .
+    container_name: autogen-multi-agent
+    ports:
+      - "8501:8501"  # Streamlit UI
+      - "8000:8000"  # FastAPI (optional)
+    volumes:
+      - ./:/app  # Mount current directory for live updates
+      - autogen-data:/app/data  # Persist database files
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  autogen-data:
+    driver: local
