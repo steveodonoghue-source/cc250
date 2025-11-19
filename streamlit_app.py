@@ -2322,6 +2322,189 @@ def render_sidebar():
 
         st.divider()
 
+        # Skill Library Browser (NEW Feature #6)
+        st.markdown("### 🧠 Skill Library")
+
+        # Get all skills from database
+        try:
+            all_skills = db.list_skills(active_only=True, limit=100)
+
+            # Search/filter bar
+            search_term = st.text_input(
+                "🔍 Search Skills",
+                placeholder="Search by name or description...",
+                key="skill_search"
+            )
+
+            # Filter skills by search term
+            if search_term:
+                filtered_skills = [
+                    s for s in all_skills
+                    if search_term.lower() in s['tool_name'].lower()
+                    or search_term.lower() in s['description'].lower()
+                ]
+            else:
+                filtered_skills = all_skills
+
+            # Display skill count
+            st.caption(f"📚 {len(filtered_skills)} skills available")
+
+            # Display skills
+            if filtered_skills:
+                # Sort options
+                sort_by = st.selectbox(
+                    "Sort by",
+                    ["Name", "Usage Count", "Date Added"],
+                    key="skill_sort"
+                )
+
+                # Sort skills
+                if sort_by == "Usage Count":
+                    sorted_skills = sorted(filtered_skills, key=lambda x: x.get('usage_count', 0), reverse=True)
+                elif sort_by == "Date Added":
+                    sorted_skills = sorted(filtered_skills, key=lambda x: x.get('created_at', ''), reverse=True)
+                else:  # Name
+                    sorted_skills = sorted(filtered_skills, key=lambda x: x['tool_name'])
+
+                # Display top skills in cards
+                with st.expander(f"📦 Browse Skills ({len(sorted_skills)})", expanded=True):
+                    for skill in sorted_skills[:20]:  # Show top 20
+                        with st.container():
+                            # Skill header
+                            col1, col2, col3 = st.columns([3, 1, 1])
+
+                            with col1:
+                                st.markdown(f"**{skill['tool_name']}**")
+                                st.caption(skill['description'][:60] + "..." if len(skill['description']) > 60 else skill['description'])
+
+                            with col2:
+                                st.caption(f"📊 {skill.get('usage_count', 0)} uses")
+
+                            with col3:
+                                # Quick actions
+                                if st.button("👁️", key=f"view_{skill['id']}", help="View details"):
+                                    st.session_state[f"view_skill_{skill['id']}"] = True
+
+                            # Expanded details (if view button clicked)
+                            if st.session_state.get(f"view_skill_{skill['id']}", False):
+                                st.markdown("**Description:**")
+                                st.text(skill['description'])
+
+                                st.markdown("**Parameters:**")
+                                params = skill.get('parameters', {})
+                                if params:
+                                    for param, ptype in params.items():
+                                        st.text(f"  • {param}: {ptype}")
+                                else:
+                                    st.text("  No parameters")
+
+                                # Code preview
+                                with st.expander("💻 View Code"):
+                                    st.code(skill['code'], language='python')
+
+                                # Safety notes
+                                if skill.get('safety_notes'):
+                                    with st.expander("⚠️ Safety Notes"):
+                                        for note in skill['safety_notes']:
+                                            st.text(f"• {note}")
+
+                                # Metadata
+                                st.caption(f"Created: {skill.get('created_at', 'Unknown')[:10]}")
+
+                                # Action buttons
+                                col_act1, col_act2, col_act3 = st.columns(3)
+
+                                with col_act1:
+                                    # Export skill as JSON
+                                    skill_json = {
+                                        "tool_name": skill['tool_name'],
+                                        "description": skill['description'],
+                                        "parameters": skill['parameters'],
+                                        "code": skill['code'],
+                                        "safety_notes": skill['safety_notes']
+                                    }
+                                    st.download_button(
+                                        "📥 Export",
+                                        data=str(skill_json),
+                                        file_name=f"{skill['tool_name']}.json",
+                                        mime="application/json",
+                                        key=f"export_{skill['id']}",
+                                        help="Export skill for sharing"
+                                    )
+
+                                with col_act2:
+                                    # Copy to clipboard (show code)
+                                    if st.button("📋 Copy", key=f"copy_{skill['id']}", help="Copy code"):
+                                        st.code(skill['code'], language='python')
+                                        st.success("Code displayed above!")
+
+                                with col_act3:
+                                    # Delete skill
+                                    if st.button("🗑️ Delete", key=f"delete_{skill['id']}", help="Delete skill"):
+                                        try:
+                                            db.delete_skill(skill['tool_name'])
+                                            st.success(f"Deleted: {skill['tool_name']}")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Delete failed: {e}")
+
+                                # Close button
+                                if st.button("✖️ Close", key=f"close_{skill['id']}"):
+                                    st.session_state[f"view_skill_{skill['id']}"] = False
+                                    st.rerun()
+
+                            st.markdown("---")
+
+            else:
+                st.info("No skills found. Agents will generate skills dynamically as needed.")
+
+            # Quick actions
+            st.markdown("**Quick Actions:**")
+            col_qa1, col_qa2 = st.columns(2)
+
+            with col_qa1:
+                # Import skill from JSON
+                uploaded_skill = st.file_uploader(
+                    "📤 Import Skill",
+                    type=['json'],
+                    key="import_skill",
+                    help="Import a skill from JSON file"
+                )
+
+                if uploaded_skill:
+                    try:
+                        import json
+                        skill_data = json.load(uploaded_skill)
+
+                        # Validate required fields
+                        required = ['tool_name', 'description', 'code', 'parameters', 'safety_notes']
+                        if all(k in skill_data for k in required):
+                            # Save to database
+                            db.save_skill(
+                                tool_name=skill_data['tool_name'],
+                                description=skill_data['description'],
+                                code=skill_data['code'],
+                                parameters=skill_data['parameters'],
+                                safety_notes=skill_data['safety_notes']
+                            )
+                            st.success(f"✅ Imported: {skill_data['tool_name']}")
+                            st.rerun()
+                        else:
+                            st.error("Invalid skill format. Missing required fields.")
+                    except Exception as e:
+                        st.error(f"Import failed: {e}")
+
+            with col_qa2:
+                # Refresh skills list
+                if st.button("🔄 Refresh", use_container_width=True, help="Reload skills from database"):
+                    st.rerun()
+
+        except Exception as e:
+            st.error(f"Skill library error: {e}")
+            st.caption("Skills can be viewed once generated by SkillGenerator agent")
+
+        st.divider()
+
         # Session stats
         st.markdown("### 📈 Session Stats")
         st.metric("Total Messages", len(st.session_state.messages))
