@@ -3225,6 +3225,242 @@ def render_sidebar():
 
         st.divider()
 
+        # Integration Hub (Feature #16)
+        st.markdown("### 🔗 Integration Hub")
+
+        import database_integrations as db_int
+
+        int_tab1, int_tab2, int_tab3, int_tab4 = st.tabs(["🐙 GitHub", "💬 Slack", "🔗 Webhooks", "📦 Export/Import"])
+
+        with int_tab1:
+            st.markdown("#### GitHub Integration")
+
+            try:
+                # List existing GitHub integrations
+                github_integrations = db_int.list_integrations(integration_type="github", enabled_only=True)
+
+                if github_integrations:
+                    selected_github = st.selectbox(
+                        "Select GitHub Integration",
+                        [i['name'] for i in github_integrations],
+                        key="github_int_select"
+                    )
+
+                    if selected_github:
+                        integration = next(i for i in github_integrations if i['name'] == selected_github)
+
+                        # List repositories
+                        repos = db_int.list_github_repos(integration['id'], active_only=True)
+
+                        if repos:
+                            st.markdown("**Connected Repositories:**")
+                            for repo in repos:
+                                with st.expander(f"📁 {repo['repo_full_name']}"):
+                                    st.text(f"Status: {repo['sync_status']}")
+                                    st.text(f"Skills Imported: {repo['skills_imported']}")
+                                    st.text(f"Last Sync: {repo['last_sync_at'] or 'Never'}")
+
+                                    if st.button(f"Sync Now", key=f"sync_repo_{repo['id']}"):
+                                        with st.spinner("Syncing..."):
+                                            success, message = db_int.sync_github_repo(repo['id'])
+                                            if success:
+                                                st.success(message)
+                                            else:
+                                                st.error(message)
+                        else:
+                            st.info("No repositories connected yet")
+
+                        # Add new repository
+                        with st.expander("➕ Add Repository"):
+                            repo_name = st.text_input("Repository (owner/repo)", key="new_repo_name")
+                            repo_url = st.text_input("Repository URL", key="new_repo_url")
+
+                            if st.button("Add Repository", key="add_repo_btn"):
+                                if repo_name and repo_url:
+                                    repo_id = db_int.add_github_repo(
+                                        integration_id=integration['id'],
+                                        repo_full_name=repo_name,
+                                        repo_url=repo_url
+                                    )
+                                    st.success(f"Repository added! ID: {repo_id}")
+                                    st.rerun()
+                else:
+                    st.info("No GitHub integrations configured")
+                    with st.expander("➕ Create GitHub Integration"):
+                        st.markdown("Create a GitHub integration via API:")
+                        st.code("""
+POST /api/v1/integrations
+{
+  "integration_type": "github",
+  "name": "My GitHub",
+  "config": {},
+  "credentials": {"access_token": "YOUR_TOKEN"}
+}
+                        """, language="json")
+
+            except Exception as e:
+                st.error(f"GitHub integration error: {e}")
+
+        with int_tab2:
+            st.markdown("#### Slack Notifications")
+
+            try:
+                slack_integrations = db_int.list_integrations(integration_type="slack", enabled_only=True)
+
+                if slack_integrations:
+                    selected_slack = st.selectbox(
+                        "Select Slack Integration",
+                        [i['name'] for i in slack_integrations],
+                        key="slack_int_select"
+                    )
+
+                    if selected_slack:
+                        integration = next(i for i in slack_integrations if i['name'] == selected_slack)
+
+                        # List channels
+                        channels = db_int.list_slack_channels(integration['id'], active_only=True)
+
+                        if channels:
+                            st.markdown("**Connected Channels:**")
+                            for channel in channels:
+                                with st.expander(f"💬 {channel['channel_name']}"):
+                                    st.text(f"Channel ID: {channel['channel_id']}")
+                                    st.text(f"Workspace: {channel['workspace_name'] or 'N/A'}")
+                                    st.text(f"Total Notifications: {channel['total_notifications']}")
+                                    st.text(f"Last Notification: {channel['last_notification_at'] or 'Never'}")
+
+                                    # Send test notification
+                                    if st.button("Send Test", key=f"test_slack_{channel['id']}"):
+                                        success = db_int.send_slack_notification(
+                                            channel_id=channel['id'],
+                                            event_type="test",
+                                            message="🧪 Test notification from Integration Hub!"
+                                        )
+                                        if success:
+                                            st.success("Test notification sent!")
+                                        else:
+                                            st.error("Failed to send notification")
+                        else:
+                            st.info("No Slack channels connected yet")
+                else:
+                    st.info("No Slack integrations configured")
+                    with st.expander("➕ Create Slack Integration"):
+                        st.markdown("Create a Slack integration via API:")
+                        st.code("""
+POST /api/v1/integrations
+{
+  "integration_type": "slack",
+  "name": "My Slack",
+  "config": {},
+  "credentials": {"webhook_url": "YOUR_WEBHOOK_URL"}
+}
+                        """, language="json")
+
+            except Exception as e:
+                st.error(f"Slack integration error: {e}")
+
+        with int_tab3:
+            st.markdown("#### Webhook Endpoints")
+
+            try:
+                webhooks = db_int.list_webhooks(active_only=True)
+
+                if webhooks:
+                    st.markdown("**Active Webhooks:**")
+                    for webhook in webhooks[:10]:
+                        with st.expander(f"🔗 {webhook['endpoint_url']}"):
+                            st.text(f"Webhook ID: {webhook['id']}")
+                            st.text(f"Events: {', '.join(webhook['events'])}")
+                            st.text(f"Total Deliveries: {webhook['total_deliveries']}")
+                            st.text(f"Successful: {webhook['successful_deliveries']}")
+                            st.text(f"Failed: {webhook['failed_deliveries']}")
+                            st.text(f"Last Triggered: {webhook['last_triggered_at'] or 'Never'}")
+
+                            # Test webhook
+                            if st.button("Trigger Test", key=f"test_webhook_{webhook['id']}"):
+                                delivery_id = db_int.trigger_webhook(
+                                    webhook_id=webhook['id'],
+                                    event_type="test",
+                                    payload={"message": "Test webhook trigger"}
+                                )
+                                st.success(f"Webhook triggered! Delivery ID: {delivery_id}")
+                else:
+                    st.info("No webhooks configured")
+
+                # Create new webhook
+                with st.expander("➕ Create Webhook"):
+                    st.markdown("Create a webhook via API:")
+                    st.code("""
+POST /api/v1/integrations/webhooks
+{
+  "events": ["skill_created", "workflow_completed"],
+  "description": "My webhook"
+}
+                    """, language="json")
+
+            except Exception as e:
+                st.error(f"Webhook error: {e}")
+
+        with int_tab4:
+            st.markdown("#### Export/Import")
+
+            try:
+                # Export section
+                st.markdown("**Export Data:**")
+
+                export_scope = st.selectbox(
+                    "What to export?",
+                    ["skills", "workflows", "integrations", "all"],
+                    key="export_scope"
+                )
+
+                export_format = st.selectbox(
+                    "Export format?",
+                    ["json", "yaml", "zip"],
+                    key="export_format"
+                )
+
+                if st.button("Create Export", key="create_export_btn"):
+                    job_id = db_int.create_export_job(
+                        job_type="export",
+                        export_format=export_format,
+                        scope=export_scope
+                    )
+                    st.success(f"Export job created! Job ID: {job_id}")
+                    st.info("Check export status via API: GET /api/v1/integrations/export/{job_id}")
+
+                st.divider()
+
+                # Recent export jobs
+                st.markdown("**Recent Export Jobs:**")
+                export_jobs = db_int.list_export_jobs(job_type="export", limit=10)
+
+                if export_jobs:
+                    for job in export_jobs:
+                        status_emoji = {
+                            "pending": "⏳",
+                            "processing": "⚙️",
+                            "completed": "✅",
+                            "failed": "❌"
+                        }.get(job['status'], "")
+
+                        st.text(f"{status_emoji} Job #{job['id']}: {job['scope']} as {job['export_format']} - {job['status']}")
+                        if job['file_path']:
+                            st.caption(f"File: {job['file_path']} ({job['file_size_bytes']} bytes)")
+                else:
+                    st.info("No export jobs yet")
+
+                st.divider()
+
+                # Import section
+                st.markdown("**Import Data:**")
+                st.info("Import skills from JSON via API: POST /api/v1/integrations/import/skills")
+
+            except Exception as e:
+                st.error(f"Export/Import error: {e}")
+
+        st.divider()
+
         # Session stats
         st.markdown("### 📈 Session Stats")
         st.metric("Total Messages", len(st.session_state.messages))

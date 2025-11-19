@@ -27,6 +27,7 @@ import asyncio
 import uuid
 import logging
 import os
+import json
 
 # Import our modules
 import database as db
@@ -34,6 +35,7 @@ import database_marketplace as db_market
 import database_cost_optimization as db_cost
 import database_orchestration as db_orch
 import database_testing_quality as db_test
+import database_integrations as db_int
 from streamlit_app import create_team, TextMessage
 import streamlit as st
 
@@ -1003,6 +1005,256 @@ async def validate_imports(code: str):
     return {
         "is_safe": is_safe,
         "issues": issues
+    }
+
+
+# ============================================================================
+# INTEGRATION HUB (Feature #16)
+# ============================================================================
+
+# --- Integration Models ---
+
+class IntegrationCreate(BaseModel):
+    """Request model for creating an integration."""
+    integration_type: str = Field(..., description="Type: github, slack, webhook, api_client, export_import")
+    name: str
+    description: str = ""
+    config: Dict
+    credentials: Optional[Dict] = None
+
+class GitHubRepoAdd(BaseModel):
+    """Request model for adding a GitHub repository."""
+    integration_id: int
+    repo_full_name: str = Field(..., description="e.g., 'owner/repo'")
+    repo_url: str
+    auto_import: bool = True
+    skill_path_pattern: str = "*.py"
+
+class WebhookCreate(BaseModel):
+    """Request model for creating a webhook."""
+    integration_id: Optional[int] = None
+    events: List[str] = Field(..., description="Events to trigger on")
+    description: str = ""
+
+class SlackChannelAdd(BaseModel):
+    """Request model for adding a Slack channel."""
+    integration_id: int
+    channel_id: str
+    channel_name: str
+    workspace_id: Optional[str] = None
+    workspace_name: Optional[str] = None
+    event_subscriptions: List[str]
+
+class ExportJobCreate(BaseModel):
+    """Request model for creating an export job."""
+    job_type: str = Field(..., description="export or import")
+    export_format: str = Field(..., description="json, yaml, zip, tar.gz")
+    scope: str = Field(..., description="skills, workflows, integrations, all")
+    metadata: Optional[Dict] = None
+
+# --- Integration Management ---
+
+@app.get("/api/v1/integrations/types")
+async def list_integration_types():
+    """List all available integration types."""
+    import sqlite3
+    conn = sqlite3.connect(db_int.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM integration_types WHERE is_active = 1")
+    types = [dict(row) for row in cursor.fetchall()]
+
+    for t in types:
+        t['config_schema'] = json.loads(t['config_schema']) if t['config_schema'] else {}
+
+    conn.close()
+    return types
+
+@app.post("/api/v1/integrations")
+async def create_integration(integration: IntegrationCreate):
+    """Create a new integration."""
+    integration_id = db_int.create_integration(
+        integration_type=integration.integration_type,
+        name=integration.name,
+        config=integration.config,
+        credentials=integration.credentials,
+        description=integration.description
+    )
+    return {"integration_id": integration_id, "status": "created"}
+
+@app.get("/api/v1/integrations/{integration_id}")
+async def get_integration(integration_id: int):
+    """Get integration by ID."""
+    integration = db_int.get_integration(integration_id)
+    if not integration:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    return integration
+
+@app.get("/api/v1/integrations")
+async def list_integrations(integration_type: Optional[str] = None, enabled_only: bool = False):
+    """List all integrations."""
+    integrations = db_int.list_integrations(
+        integration_type=integration_type,
+        enabled_only=enabled_only
+    )
+    return integrations
+
+@app.put("/api/v1/integrations/{integration_id}/toggle")
+async def toggle_integration(integration_id: int, enabled: bool):
+    """Enable or disable an integration."""
+    success = db_int.toggle_integration(integration_id, enabled)
+    if not success:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    return {"status": "enabled" if enabled else "disabled"}
+
+@app.get("/api/v1/integrations/{integration_id}/logs")
+async def get_integration_logs(integration_id: int, log_level: Optional[str] = None, limit: int = 100):
+    """Get logs for an integration."""
+    logs = db_int.get_integration_logs(integration_id, log_level, limit)
+    return logs
+
+# --- GitHub Integration ---
+
+@app.post("/api/v1/integrations/github/repos")
+async def add_github_repo(repo: GitHubRepoAdd):
+    """Add a GitHub repository to an integration."""
+    repo_id = db_int.add_github_repo(
+        integration_id=repo.integration_id,
+        repo_full_name=repo.repo_full_name,
+        repo_url=repo.repo_url,
+        auto_import=repo.auto_import,
+        skill_path_pattern=repo.skill_path_pattern
+    )
+    return {"repo_id": repo_id, "status": "added"}
+
+@app.get("/api/v1/integrations/github/{integration_id}/repos")
+async def list_github_repos(integration_id: int, active_only: bool = False):
+    """List GitHub repositories for an integration."""
+    repos = db_int.list_github_repos(integration_id, active_only)
+    return repos
+
+@app.post("/api/v1/integrations/github/repos/{repo_id}/sync")
+async def sync_github_repo(repo_id: int):
+    """Sync a GitHub repository and import skills."""
+    success, message = db_int.sync_github_repo(repo_id)
+    if not success:
+        raise HTTPException(status_code=500, detail=message)
+    return {"status": "success", "message": message}
+
+# --- Webhook System ---
+
+@app.post("/api/v1/integrations/webhooks")
+async def create_webhook(webhook: WebhookCreate):
+    """Create a new webhook endpoint."""
+    webhook_id, endpoint_url, secret_key = db_int.create_webhook(
+        integration_id=webhook.integration_id,
+        events=webhook.events,
+        description=webhook.description
+    )
+    return {
+        "webhook_id": webhook_id,
+        "endpoint_url": endpoint_url,
+        "secret_key": secret_key,
+        "status": "created"
+    }
+
+@app.get("/api/v1/integrations/webhooks")
+async def list_webhooks(integration_id: Optional[int] = None, active_only: bool = False):
+    """List all webhooks."""
+    webhooks = db_int.list_webhooks(integration_id, active_only)
+    return webhooks
+
+@app.post("/api/v1/integrations/webhooks/{webhook_id}/trigger")
+async def trigger_webhook_manually(webhook_id: int, event_type: str, payload: Dict):
+    """Manually trigger a webhook for testing."""
+    delivery_id = db_int.trigger_webhook(webhook_id, event_type, payload)
+    return {"delivery_id": delivery_id, "status": "triggered"}
+
+# --- Slack Notifications ---
+
+@app.post("/api/v1/integrations/slack/channels")
+async def add_slack_channel(channel: SlackChannelAdd):
+    """Add a Slack channel for notifications."""
+    channel_id = db_int.add_slack_channel(
+        integration_id=channel.integration_id,
+        channel_id=channel.channel_id,
+        channel_name=channel.channel_name,
+        event_subscriptions=channel.event_subscriptions,
+        workspace_id=channel.workspace_id,
+        workspace_name=channel.workspace_name
+    )
+    return {"slack_channel_id": channel_id, "status": "added"}
+
+@app.get("/api/v1/integrations/slack/{integration_id}/channels")
+async def list_slack_channels(integration_id: int, active_only: bool = False):
+    """List Slack channels for an integration."""
+    channels = db_int.list_slack_channels(integration_id, active_only)
+    return channels
+
+@app.post("/api/v1/integrations/slack/channels/{channel_id}/notify")
+async def send_slack_notification_api(channel_id: int, event_type: str, message: str, details: Optional[Dict] = None):
+    """Send a test notification to a Slack channel."""
+    success = db_int.send_slack_notification(channel_id, event_type, message, details)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to send notification")
+    return {"status": "sent"}
+
+# --- Export/Import ---
+
+@app.post("/api/v1/integrations/export")
+async def create_export(job: ExportJobCreate):
+    """Create an export job."""
+    job_id = db_int.create_export_job(
+        job_type=job.job_type,
+        export_format=job.export_format,
+        scope=job.scope,
+        metadata=job.metadata
+    )
+
+    # Process export immediately for now
+    if job.scope == "skills":
+        export_data = db_int.export_skills_to_json()
+
+        # Save to file
+        import json
+        output_path = f"/tmp/export_{job_id}.json"
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+
+        file_size = os.path.getsize(output_path)
+        db_int.update_export_job(
+            job_id=job_id,
+            status="completed",
+            file_path=output_path,
+            file_size=file_size,
+            items_processed=export_data['count']
+        )
+
+    return {"job_id": job_id, "status": "created"}
+
+@app.get("/api/v1/integrations/export/{job_id}")
+async def get_export_job(job_id: int):
+    """Get export job status and details."""
+    job = db_int.get_export_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return job
+
+@app.get("/api/v1/integrations/export")
+async def list_export_jobs(job_type: Optional[str] = None, limit: int = 50):
+    """List export/import jobs."""
+    jobs = db_int.list_export_jobs(job_type, limit)
+    return jobs
+
+@app.post("/api/v1/integrations/import/skills")
+async def import_skills(import_data: Dict):
+    """Import skills from JSON data."""
+    imported_count, errors = db_int.import_skills_from_json(import_data)
+    return {
+        "imported_count": imported_count,
+        "errors": errors,
+        "status": "completed" if not errors else "completed_with_errors"
     }
 
 
