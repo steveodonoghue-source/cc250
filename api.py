@@ -32,6 +32,8 @@ import os
 import database as db
 import database_marketplace as db_market
 import database_cost_optimization as db_cost
+import database_orchestration as db_orch
+import database_testing_quality as db_test
 from streamlit_app import create_team, TextMessage
 import streamlit as st
 
@@ -453,6 +455,60 @@ class CostTrackingRequest(BaseModel):
     input_tokens: int
     output_tokens: int
 
+# Orchestration Models
+class WorkflowCreate(BaseModel):
+    """Request model for creating a workflow."""
+    name: str
+    description: str
+    workflow_type: str = Field(..., description="One of: sequential, parallel, conditional, hybrid")
+    config: Dict
+    created_by: Optional[str] = "api_user"
+
+class WorkflowStepCreate(BaseModel):
+    """Request model for adding a workflow step."""
+    step_number: int
+    agent_name: str
+    task_description: Optional[str] = None
+    depends_on_step: Optional[int] = None
+    parallel_group: Optional[int] = 0
+    condition: Optional[str] = None
+    config: Optional[Dict] = None
+
+class WorkflowExecutionStart(BaseModel):
+    """Request model for starting workflow execution."""
+    workflow_id: int
+    session_id: str
+    input_data: Optional[Dict] = None
+
+class RoutingRequest(BaseModel):
+    """Request model for task routing."""
+    task: str
+    keywords: Optional[List[str]] = None
+
+# Testing & Quality Models
+class TestSuiteCreate(BaseModel):
+    """Request model for creating a test suite."""
+    skill_id: int
+    name: str
+    description: Optional[str] = ""
+
+class TestCaseCreate(BaseModel):
+    """Request model for creating a test case."""
+    suite_id: int
+    name: str
+    test_code: str
+    expected_output: Optional[Any] = None
+    description: Optional[str] = ""
+
+class SafetyCheckRequest(BaseModel):
+    """Request model for safety check."""
+    skill_id: int
+    code: str
+
+class QualityScoreRequest(BaseModel):
+    """Request model for quality score calculation."""
+    skill_id: int
+
 # --- Category Endpoints ---
 
 @app.get("/api/v1/marketplace/categories")
@@ -724,6 +780,230 @@ async def get_cache_stats():
     """Get cache performance statistics."""
     stats = db_cost.get_cache_stats()
     return stats
+
+
+# ============================================================================
+# Orchestration Endpoints
+# ============================================================================
+
+# --- Workflow Management ---
+
+@app.post("/api/v1/orchestration/workflows")
+async def create_workflow(workflow: WorkflowCreate):
+    """Create a new workflow definition."""
+    workflow_id = db_orch.create_workflow(
+        name=workflow.name,
+        description=workflow.description,
+        workflow_type=workflow.workflow_type,
+        config=workflow.config,
+        created_by=workflow.created_by
+    )
+    return {"workflow_id": workflow_id, "status": "created"}
+
+@app.get("/api/v1/orchestration/workflows")
+async def list_workflows(active_only: bool = True):
+    """List all workflow definitions."""
+    workflows = db_orch.list_workflows(active_only=active_only)
+    return workflows
+
+@app.get("/api/v1/orchestration/workflows/{workflow_id}")
+async def get_workflow(workflow_id: int):
+    """Get workflow definition with steps."""
+    workflow = db_orch.get_workflow(workflow_id)
+    if workflow:
+        return workflow
+    return {"error": f"Workflow {workflow_id} not found"}
+
+@app.post("/api/v1/orchestration/workflows/{workflow_id}/steps")
+async def add_workflow_step(workflow_id: int, step: WorkflowStepCreate):
+    """Add a step to a workflow."""
+    step_id = db_orch.add_workflow_step(
+        workflow_id=workflow_id,
+        step_number=step.step_number,
+        agent_name=step.agent_name,
+        task_description=step.task_description,
+        depends_on_step=step.depends_on_step,
+        parallel_group=step.parallel_group,
+        condition=step.condition,
+        config=step.config
+    )
+    return {"step_id": step_id, "status": "added"}
+
+@app.post("/api/v1/orchestration/workflows/{workflow_id}/execute")
+async def start_workflow_execution(workflow_id: int, execution: WorkflowExecutionStart):
+    """Start a workflow execution."""
+    execution_id = db_orch.start_workflow_execution(
+        workflow_id=workflow_id,
+        session_id=execution.session_id,
+        input_data=execution.input_data
+    )
+    return {"execution_id": execution_id, "status": "started"}
+
+@app.put("/api/v1/orchestration/executions/{execution_id}")
+async def update_execution(execution_id: int, status: str, output_data: Optional[Dict] = None, error: Optional[str] = None):
+    """Update workflow execution status."""
+    db_orch.update_workflow_execution(
+        execution_id=execution_id,
+        status=status,
+        output_data=output_data,
+        error=error
+    )
+    return {"status": "updated"}
+
+# --- Workflow Templates ---
+
+@app.get("/api/v1/orchestration/templates")
+async def list_templates(category: Optional[str] = None):
+    """List workflow templates."""
+    templates = db_orch.list_workflow_templates(category=category)
+    return templates
+
+@app.post("/api/v1/orchestration/templates/{template_id}/instantiate")
+async def create_from_template(template_id: int, name: str, session_id: str):
+    """Create and start a workflow from a template."""
+    workflow_id = db_orch.create_workflow_from_template(
+        template_id=template_id,
+        name=name,
+        session_id=session_id
+    )
+    return {"workflow_id": workflow_id, "status": "created_from_template"}
+
+# --- Routing ---
+
+@app.post("/api/v1/orchestration/route")
+async def route_task(request: RoutingRequest):
+    """Route a task to the best agent."""
+    agent = db_orch.get_best_agent_for_task(
+        task=request.task,
+        keywords=request.keywords
+    )
+    return {"recommended_agent": agent}
+
+@app.get("/api/v1/orchestration/agents/{agent_name}/specializations")
+async def get_specializations(agent_name: str):
+    """Get agent specializations."""
+    specializations = db_orch.get_agent_specializations(agent_name)
+    return specializations
+
+
+# ============================================================================
+# Testing & Quality Endpoints
+# ============================================================================
+
+# --- Test Management ---
+
+@app.post("/api/v1/testing/suites")
+async def create_test_suite(suite: TestSuiteCreate):
+    """Create a test suite for a skill."""
+    suite_id = db_test.create_test_suite(
+        skill_id=suite.skill_id,
+        name=suite.name,
+        description=suite.description
+    )
+    return {"suite_id": suite_id, "status": "created"}
+
+@app.post("/api/v1/testing/cases")
+async def create_test_case(test_case: TestCaseCreate):
+    """Add a test case to a suite."""
+    case_id = db_test.add_test_case(
+        suite_id=test_case.suite_id,
+        name=test_case.name,
+        test_code=test_case.test_code,
+        expected_output=test_case.expected_output,
+        description=test_case.description
+    )
+    return {"test_case_id": case_id, "status": "created"}
+
+@app.post("/api/v1/testing/cases/{test_case_id}/run")
+async def run_test(test_case_id: int, skill_id: int, skill_code: str):
+    """Execute a test case."""
+    result = db_test.run_test_case(
+        test_case_id=test_case_id,
+        skill_id=skill_id,
+        skill_code=skill_code
+    )
+    return result
+
+# --- Safety Checks ---
+
+@app.post("/api/v1/testing/safety/check")
+async def check_safety(request: SafetyCheckRequest):
+    """Perform safety analysis on skill code."""
+    risk_level, issues = db_test.check_code_safety(
+        skill_id=request.skill_id,
+        code=request.code
+    )
+    return {
+        "risk_level": risk_level,
+        "issues_found": len(issues),
+        "issues": issues
+    }
+
+@app.get("/api/v1/testing/safety/patterns")
+async def list_unsafe_patterns():
+    """List all unsafe code patterns."""
+    import sqlite3
+    conn = sqlite3.connect(db_test.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM unsafe_patterns WHERE is_active = 1")
+    patterns = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return patterns
+
+# --- Quality Scoring ---
+
+@app.post("/api/v1/testing/quality/calculate")
+async def calculate_quality(request: QualityScoreRequest):
+    """Calculate comprehensive quality score."""
+    scores = db_test.calculate_quality_score(skill_id=request.skill_id)
+    return scores
+
+@app.get("/api/v1/testing/quality/report/{skill_id}")
+async def get_quality_report(skill_id: int):
+    """Get comprehensive quality report for a skill."""
+    report = db_test.get_skill_quality_report(skill_id=skill_id)
+    return report
+
+@app.get("/api/v1/testing/quality/leaderboard")
+async def get_quality_leaderboard(limit: int = 10):
+    """Get top quality skills (leaderboard)."""
+    import sqlite3
+    conn = sqlite3.connect(db_test.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT qs.*, s.tool_name, s.description
+        FROM quality_scores qs
+        JOIN skills s ON qs.skill_id = s.id
+        ORDER BY qs.overall_score DESC
+        LIMIT ?
+    """, (limit,))
+
+    leaderboard = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return leaderboard
+
+# --- Code Analysis ---
+
+@app.post("/api/v1/testing/analyze/complexity")
+async def analyze_complexity(code: str):
+    """Analyze code complexity metrics."""
+    metrics = db_test.analyze_code_complexity(code)
+    return metrics
+
+@app.post("/api/v1/testing/analyze/imports")
+async def validate_imports(code: str):
+    """Validate code imports for safety."""
+    is_safe, issues = db_test.validate_imports(code)
+    return {
+        "is_safe": is_safe,
+        "issues": issues
+    }
 
 
 # ============================================================================
