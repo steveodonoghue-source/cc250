@@ -1026,18 +1026,19 @@ def tool_ingest_document(file_path: str, collection_name: str = "default_knowled
     """
     Tool #12: Ingest document into ChromaDB for long-term knowledge.
 
-    NEW TOOL for Vector Database RAG:
+    ENHANCED for Feature #5 (ChromaDB RAG):
     - Reads document (txt, md, py, pdf, docx)
-    - Chunks text into manageable pieces
-    - Generates embeddings
-    - Stores in ChromaDB collection
+    - Chunks text with smart overlap
+    - Generates embeddings with metadata
+    - Stores with rich metadata: file type, date, page numbers, hierarchy
+    - Enables source citation and metadata filtering
 
     Args:
         file_path: Path to document file
         collection_name: ChromaDB collection name (default: "default_knowledge")
 
     Returns:
-        Success message with chunk count
+        Success message with chunk count and metadata info
     """
     logger.info(f"📥 Tool called: ingest_document('{file_path}', collection='{collection_name}')")
 
@@ -1062,21 +1063,37 @@ def tool_ingest_document(file_path: str, collection_name: str = "default_knowled
 
         content = ""
         file_ext = path.suffix.lower()
+        page_contents = []  # For PDF page tracking
+
+        # Get file metadata
+        file_size = path.stat().st_size
+        ingestion_date = datetime.now().isoformat()
+        file_name = path.name
 
         # Text-based files
         if file_ext in ['.txt', '.md', '.py', '.json', '.yaml', '.yml', '.sh', '.bash']:
             content = path.read_text(encoding='utf-8')
-        # PDF files
+            file_type = "code" if file_ext in ['.py', '.sh', '.bash', '.json', '.yaml', '.yml'] else "text"
+        # PDF files (with page tracking)
         elif file_ext == '.pdf':
             if not pdf_available:
                 return "❌ PDF support not available. Install PyPDF2."
             pdf_reader = PdfReader(str(path))
-            content = "\n\n".join([page.extract_text() for page in pdf_reader.pages])
+            file_type = "pdf"
+            # Track page numbers for better citations
+            for page_num, page in enumerate(pdf_reader.pages, start=1):
+                page_text = page.extract_text()
+                page_contents.append({
+                    "text": page_text,
+                    "page_number": page_num
+                })
+            content = "\n\n".join([p["text"] for p in page_contents])
         # DOCX files
         elif file_ext == '.docx':
             if not docx_available:
                 return "❌ DOCX support not available. Install python-docx."
             doc = DocxDocument(str(path))
+            file_type = "docx"
             content = "\n\n".join([paragraph.text for paragraph in doc.paragraphs])
         else:
             return f"❌ Unsupported file type: {file_ext}. Supported: txt, md, py, pdf, docx"
@@ -1084,18 +1101,22 @@ def tool_ingest_document(file_path: str, collection_name: str = "default_knowled
         if not content.strip():
             return f"❌ No content extracted from {file_path}"
 
-        # Chunk the text
+        # Enhanced chunking with better overlap for context preservation
         if text_splitter_available and RecursiveCharacterTextSplitter:
             splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50,
-                length_function=len
+                chunk_size=800,  # Increased for better context
+                chunk_overlap=100,  # More overlap for continuity
+                length_function=len,
+                separators=["\n\n", "\n", ". ", " ", ""]  # Smarter splitting
             )
             chunks = splitter.split_text(content)
         else:
             # Simple chunking if langchain not available
-            chunk_size = 500
-            chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
+            chunk_size = 800
+            overlap = 100
+            chunks = []
+            for i in range(0, len(content), chunk_size - overlap):
+                chunks.append(content[i:i+chunk_size])
 
         # Get ChromaDB client and collection
         client = st.session_state.get("chroma_client")
@@ -1121,35 +1142,266 @@ def tool_ingest_document(file_path: str, collection_name: str = "default_knowled
         if not embedding_model:
             return "❌ Failed to load embedding model"
 
-        # Add chunks to collection
-        chunk_ids = [f"{path.stem}_chunk_{i}" for i in range(len(chunks))]
+        # Enhanced metadata for each chunk
+        metadatas = []
+        for i, chunk in enumerate(chunks):
+            metadata = {
+                "source": file_path,
+                "file_name": file_name,
+                "file_type": file_type,
+                "file_extension": file_ext,
+                "file_size_bytes": file_size,
+                "ingestion_date": ingestion_date,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+                "chunk_length": len(chunk),
+                "collection": collection_name
+            }
+
+            # Add page number for PDFs
+            if page_contents:
+                # Estimate which page this chunk is from
+                char_position = content.find(chunk[:50])  # Find chunk in full content
+                chars_per_page = len(content) / len(page_contents)
+                estimated_page = int(char_position / chars_per_page) + 1
+                metadata["page_number"] = min(estimated_page, len(page_contents))
+
+            # Add document hierarchy hints for code files
+            if file_type == "code":
+                if "def " in chunk or "class " in chunk:
+                    metadata["contains_definition"] = True
+                if "import " in chunk:
+                    metadata["contains_imports"] = True
+
+            metadatas.append(metadata)
+
+        # Add chunks to collection with unique IDs
+        timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        chunk_ids = [f"{path.stem}_{timestamp_suffix}_chunk_{i}" for i in range(len(chunks))]
         embeddings = embedding_model.encode(chunks).tolist()
 
         collection.add(
             documents=chunks,
             embeddings=embeddings,
             ids=chunk_ids,
-            metadatas=[{
-                "source": file_path,
-                "chunk_index": i,
-                "total_chunks": len(chunks)
-            } for i in range(len(chunks))]
+            metadatas=metadatas
         )
 
-        logger.info(f"Ingested {len(chunks)} chunks from {file_path}")
+        logger.info(f"Ingested {len(chunks)} chunks from {file_path} with enhanced metadata")
 
-        return f"""✅ Document ingested successfully!
+        return f"""✅ Document ingested successfully with enhanced metadata!
 
-File: {file_path}
-Chunks: {len(chunks)}
-Collection: {collection_name}
-Total documents in collection: {collection.count()}
+📄 File: {file_name}
+📦 Chunks: {len(chunks)} (800 chars each, 100 char overlap)
+🏷️  Type: {file_type}
+📊 Size: {file_size / 1024:.1f} KB
+📚 Collection: {collection_name}
+🔢 Total documents in collection: {collection.count()}
 
-The knowledge is now available for hybrid search via tool_web_search."""
+✨ Enhanced features:
+- Rich metadata (type, date, size, page numbers)
+- Source citations enabled
+- Metadata filtering ready
+- Better chunking with context preservation
+
+Use tool_query_knowledge() for advanced RAG with citations!"""
 
     except Exception as e:
         logger.error(f"Document ingestion error: {e}")
         return f"❌ Ingestion failed: {str(e)}"
+
+
+def tool_query_knowledge(
+    query: str,
+    collection_name: str = "default_knowledge",
+    n_results: int = 5,
+    filter_file_type: str = None,
+    include_citations: bool = True
+) -> str:
+    """
+    Tool #13: Advanced RAG query with citations and hybrid search.
+
+    NEW TOOL for Feature #5 (Enhanced ChromaDB RAG):
+    - Hybrid search: Semantic (embeddings) + Keyword matching
+    - Source citations with metadata (file, page, type)
+    - Metadata filtering (by file type, date, etc.)
+    - Re-ranking for better result quality
+    - Detailed provenance tracking
+
+    Args:
+        query: Search query
+        collection_name: ChromaDB collection to search
+        n_results: Number of results to return (default: 5)
+        filter_file_type: Filter by file type (e.g., "pdf", "code", "text")
+        include_citations: Include source citations (default: True)
+
+    Returns:
+        Search results with citations and metadata
+    """
+    logger.info(f"🔎 Tool called: query_knowledge('{query}', collection='{collection_name}')")
+
+    if "tool_calls" not in st.session_state:
+        st.session_state.tool_calls = []
+
+    st.session_state.tool_calls.append({
+        "tool": "query_knowledge",
+        "query": query,
+        "collection": collection_name,
+        "filter_file_type": filter_file_type,
+        "timestamp": datetime.now().isoformat()
+    })
+
+    if not chromadb_available:
+        return "❌ ChromaDB not available. Install chromadb and sentence-transformers."
+
+    try:
+        # Get ChromaDB client and collection
+        client = st.session_state.get("chroma_client")
+        if not client:
+            client = get_chroma_client()
+            if client:
+                st.session_state.chroma_client = client
+
+        if not client:
+            return "❌ Failed to initialize ChromaDB client"
+
+        collection = get_chroma_collection(client, collection_name)
+        if not collection:
+            return f"❌ Collection '{collection_name}' not found. Ingest documents first."
+
+        if collection.count() == 0:
+            return f"❌ Collection '{collection_name}' is empty. Ingest documents first."
+
+        # Get embedding model
+        embedding_model = st.session_state.get("embedding_model")
+        if not embedding_model:
+            embedding_model = get_embedding_model()
+            if embedding_model:
+                st.session_state.embedding_model = embedding_model
+
+        if not embedding_model:
+            return "❌ Failed to load embedding model"
+
+        # Build metadata filter if specified
+        where_filter = None
+        if filter_file_type:
+            where_filter = {"file_type": filter_file_type}
+
+        # 1. SEMANTIC SEARCH (Embedding-based)
+        query_embedding = embedding_model.encode([query])[0].tolist()
+
+        semantic_results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(n_results * 2, collection.count()),  # Get more for re-ranking
+            where=where_filter,
+            include=["documents", "metadatas", "distances"]
+        )
+
+        # 2. KEYWORD SEARCH (Simple BM25-style scoring)
+        # Query for keyword matches
+        query_terms = query.lower().split()
+        all_docs = collection.get(
+            where=where_filter,
+            include=["documents", "metadatas"]
+        )
+
+        # Score documents by keyword matches
+        keyword_scores = {}
+        if all_docs and all_docs["documents"]:
+            for idx, doc in enumerate(all_docs["documents"]):
+                doc_lower = doc.lower()
+                score = sum(1 for term in query_terms if term in doc_lower)
+                if score > 0:
+                    keyword_scores[idx] = score
+
+        # 3. HYBRID FUSION (Combine semantic + keyword)
+        # Use Reciprocal Rank Fusion (RRF)
+        combined_scores = {}
+
+        # Add semantic scores (using distance - lower is better)
+        if semantic_results and semantic_results["documents"]:
+            for rank, (doc, metadata, distance) in enumerate(zip(
+                semantic_results["documents"][0],
+                semantic_results["metadatas"][0],
+                semantic_results["distances"][0]
+            ), start=1):
+                doc_id = metadata.get("source", "") + str(metadata.get("chunk_index", 0))
+                # RRF score: 1 / (k + rank), where k=60 is standard
+                combined_scores[doc_id] = combined_scores.get(doc_id, 0) + (1 / (60 + rank))
+                # Store document for later retrieval
+                if doc_id not in st.session_state.get("_rag_cache", {}):
+                    if "_rag_cache" not in st.session_state:
+                        st.session_state._rag_cache = {}
+                    st.session_state._rag_cache[doc_id] = {
+                        "document": doc,
+                        "metadata": metadata,
+                        "semantic_distance": distance
+                    }
+
+        # Add keyword scores
+        for idx, kw_score in keyword_scores.items():
+            if idx < len(all_docs["metadatas"]):
+                metadata = all_docs["metadatas"][idx]
+                doc_id = metadata.get("source", "") + str(metadata.get("chunk_index", 0))
+                # Normalize keyword score and add to combined
+                combined_scores[doc_id] = combined_scores.get(doc_id, 0) + (kw_score / 10)
+
+        # 4. RE-RANK by combined score
+        sorted_results = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+        top_results = sorted_results[:n_results]
+
+        # 5. FORMAT RESULTS WITH CITATIONS
+        if not top_results:
+            return f"❌ No results found for query: '{query}'"
+
+        result_parts = [f"🔎 Knowledge Base Search Results for: \"{query}\"\n"]
+        result_parts.append(f"📚 Collection: {collection_name}")
+        result_parts.append(f"📊 Found {len(top_results)} relevant results\n")
+
+        if filter_file_type:
+            result_parts.append(f"🔍 Filtered by type: {filter_file_type}\n")
+
+        for idx, (doc_id, score) in enumerate(top_results, 1):
+            cache_entry = st.session_state._rag_cache.get(doc_id, {})
+            doc_text = cache_entry.get("document", "")
+            metadata = cache_entry.get("metadata", {})
+
+            # Truncate long documents
+            doc_preview = doc_text[:400] + "..." if len(doc_text) > 400 else doc_text
+
+            result_parts.append(f"\n{'='*60}")
+            result_parts.append(f"\n📄 Result {idx} (Relevance: {score:.3f})")
+            result_parts.append(f"\n{'-'*60}")
+            result_parts.append(f"\n{doc_preview}\n")
+
+            # Add citations if enabled
+            if include_citations and metadata:
+                result_parts.append(f"\n📌 Citation:")
+                result_parts.append(f"   Source: {metadata.get('file_name', 'Unknown')}")
+
+                if metadata.get("page_number"):
+                    result_parts.append(f"   Page: {metadata['page_number']}")
+
+                result_parts.append(f"   Type: {metadata.get('file_type', 'Unknown')}")
+                result_parts.append(f"   Chunk: {metadata.get('chunk_index', 0) + 1}/{metadata.get('total_chunks', '?')}")
+
+                if metadata.get("ingestion_date"):
+                    date_str = metadata['ingestion_date'][:10]  # Just date part
+                    result_parts.append(f"   Indexed: {date_str}")
+
+                result_parts.append(f"   Full path: {metadata.get('source', 'Unknown')}")
+
+        result_parts.append(f"\n{'='*60}")
+        result_parts.append(f"\n\n💡 Search Details:")
+        result_parts.append(f"   - Hybrid search: Semantic (embeddings) + Keyword matching")
+        result_parts.append(f"   - Re-ranked using Reciprocal Rank Fusion (RRF)")
+        result_parts.append(f"   - Total documents in collection: {collection.count()}")
+
+        return "\n".join(result_parts)
+
+    except Exception as e:
+        logger.error(f"Knowledge query error: {e}")
+        return f"❌ Query failed: {str(e)}"
 
 
 # ============================================================================
@@ -1366,6 +1618,8 @@ Your responsibilities:
 
 Available Tools:
 - tool_web_search: Research best practices
+- tool_query_knowledge: Query internal knowledge base with citations (ENHANCED RAG)
+- tool_ingest_document: Ingest documents into knowledge base
 - tool_read_document: Read specifications
 - tool_analyze_image: Analyze diagrams
 - tool_get_current_datetime: Get timestamps
@@ -1377,6 +1631,8 @@ Always structure your plan using the TaskPlan schema and validate it."""
 
     tools = [
         FunctionTool(tool_web_search, description="Search the web for information"),
+        FunctionTool(tool_query_knowledge, description="Query internal knowledge base with hybrid search and citations"),
+        FunctionTool(tool_ingest_document, description="Ingest documents into knowledge base with rich metadata"),
         FunctionTool(tool_read_document, description="Read document files"),
         FunctionTool(tool_analyze_image, description="Analyze images and diagrams"),
         FunctionTool(tool_get_current_datetime, description="Get current date and time"),
@@ -1442,6 +1698,7 @@ Your responsibilities:
 
 Available Tools:
 - tool_web_search: Research security advisories
+- tool_query_knowledge: Query internal knowledge base for security best practices
 - tool_static_analysis: Run code quality checks
 - tool_read_document: Read code files
 - tool_analyze_image: Analyze diagrams
@@ -1459,6 +1716,7 @@ Use CodeReview schema for all reviews."""
 
     tools = [
         FunctionTool(tool_web_search, description="Search for security information"),
+        FunctionTool(tool_query_knowledge, description="Query knowledge base for security best practices with citations"),
         FunctionTool(tool_static_analysis, description="Perform static analysis"),
         FunctionTool(tool_read_document, description="Read code files"),
         FunctionTool(tool_analyze_image, description="Analyze diagrams"),
@@ -1490,6 +1748,7 @@ Your responsibilities:
 Available Tools:
 - tool_execute_code: Execute code via RQ (requires HITL approval, returns job ID)
 - tool_poll_job_result: Poll RQ job for results
+- tool_ingest_document: Ingest documents into knowledge base with metadata
 - tool_create_visualization: Generate charts
 - tool_read_document: Read files
 - tool_create_project_zip: Create ZIP archives
@@ -1518,6 +1777,7 @@ Security Guidelines:
     tools = [
         FunctionTool(tool_execute_code, description="Execute code via RQ (returns job ID)"),
         FunctionTool(tool_poll_job_result, description="Poll RQ job for results"),
+        FunctionTool(tool_ingest_document, description="Ingest documents into knowledge base with rich metadata"),
         FunctionTool(tool_create_visualization, description="Create visualizations"),
         FunctionTool(tool_read_document, description="Read files"),
         FunctionTool(tool_create_project_zip, description="Create ZIP archives"),
@@ -1593,6 +1853,7 @@ After generating, validate with tool_validate_json and hand off to Reviewer."""
 
     tools = [
         FunctionTool(tool_web_search, description="Research best practices"),
+        FunctionTool(tool_query_knowledge, description="Query knowledge base for existing patterns and examples"),
         FunctionTool(tool_read_document, description="Read existing tool code for reference"),
         FunctionTool(tool_validate_json, description="Validate SkillDefinition schema"),
     ]
