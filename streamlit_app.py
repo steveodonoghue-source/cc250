@@ -1980,11 +1980,96 @@ def render_sidebar():
 
         st.divider()
 
+        # Agent Performance Dashboard
+        st.markdown("### 📊 Agent Performance")
+
+        if st.session_state.messages:
+            # Calculate agent metrics
+            agent_stats = {}
+            for msg in st.session_state.messages:
+                agent = msg.get('agent', 'Unknown')
+                if agent not in agent_stats:
+                    agent_stats[agent] = {
+                        'messages': 0,
+                        'tokens': 0,
+                        'cost': 0.0
+                    }
+                agent_stats[agent]['messages'] += 1
+
+            # Add cost data
+            for agent_name, stats in cost_data.get("by_agent", {}).items():
+                if agent_name in agent_stats:
+                    agent_stats[agent_name]['tokens'] = stats.get('input_tokens', 0) + stats.get('output_tokens', 0)
+                    agent_stats[agent_name]['cost'] = stats.get('cost', 0.0)
+
+            # Display metrics
+            if agent_stats:
+                # Top performer by activity
+                top_agent = max(agent_stats.items(), key=lambda x: x[1]['messages'])
+                st.metric(
+                    "Most Active Agent",
+                    top_agent[0],
+                    f"{top_agent[1]['messages']} msgs"
+                )
+
+                # Agent breakdown
+                with st.expander("🤖 Agent Breakdown", expanded=False):
+                    for agent, stats in sorted(agent_stats.items(), key=lambda x: x[1]['messages'], reverse=True):
+                        st.markdown(f"**{agent}**")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.caption(f"📝 {stats['messages']}")
+                        with col2:
+                            if stats['cost'] > 0:
+                                st.caption(f"💰 ${stats['cost']:.4f}")
+                        with col3:
+                            if stats['tokens'] > 0:
+                                st.caption(f"🔢 {stats['tokens']:,}")
+                        st.markdown("---")
+
+                # Efficiency metrics
+                total_msgs = sum(s['messages'] for s in agent_stats.values())
+                if total_cost > 0 and total_msgs > 0:
+                    avg_cost_per_msg = total_cost / total_msgs
+                    st.metric("Avg Cost/Message", f"${avg_cost_per_msg:.4f}")
+
+        # Historical performance
+        with st.expander("📈 Historical Performance"):
+            try:
+                # Get cost summary from database
+                cost_summary_7d = db.get_cost_summary(days=7)
+
+                if cost_summary_7d and cost_summary_7d['total_cost'] > 0:
+                    st.markdown("**Last 7 Days**")
+                    st.metric("Total Spend", f"${cost_summary_7d['total_cost']:.2f}")
+                    st.metric("API Calls", cost_summary_7d['total_calls'])
+
+                    # Cost by agent (historical)
+                    if cost_summary_7d.get('by_agent'):
+                        st.markdown("**Top Agents (Cost)**")
+                        for agent, stats in sorted(
+                            cost_summary_7d['by_agent'].items(),
+                            key=lambda x: x[1]['cost'],
+                            reverse=True
+                        )[:3]:
+                            st.text(f"{agent}: ${stats['cost']:.3f}")
+                else:
+                    st.info("No historical data yet")
+
+            except Exception as e:
+                st.caption(f"Historical data unavailable: {e}")
+
+        st.divider()
+
         # Session stats
-        st.markdown("### 📊 Session Stats")
-        st.metric("Messages", len(st.session_state.messages))
+        st.markdown("### 📈 Session Stats")
+        st.metric("Total Messages", len(st.session_state.messages))
         st.metric("Tool Calls", len(st.session_state.tool_calls))
         st.metric("Team Status", "🟢 Active" if st.session_state.chat_active else "🔴 Inactive")
+
+        # Uploaded files count
+        if st.session_state.uploaded_files:
+            st.metric("Uploaded Files", len(st.session_state.uploaded_files))
 
         # Dynamic skills
         if st.session_state.filehandler_agent and hasattr(st.session_state.filehandler_agent, 'dynamic_tools'):
