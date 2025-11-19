@@ -599,6 +599,12 @@ def get_pack_skills(pack_id: int) -> List[Dict]:
     return skills
 
 
+# Alias for consistency with naming convention
+def get_skill_pack_skills(pack_id: int) -> List[Dict]:
+    """Get all skills in a pack (alias for get_pack_skills)."""
+    return get_pack_skills(pack_id)
+
+
 # ============================================================================
 # Enhanced Skill Listing with Marketplace Data
 # ============================================================================
