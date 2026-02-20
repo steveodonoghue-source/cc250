@@ -49,7 +49,7 @@ echo.
 
 REM Initialize databases
 echo Initializing databases...
-python -c "import database; import database_marketplace; import database_cost; import database_orchestration; import database_testing; import database_integrations; print('[OK] All databases initialized successfully!')"
+python -c "import database; import database_marketplace; import database_cost_optimization; database_cost_optimization.init_cost_optimization_db(); import database_orchestration; database_orchestration.init_orchestration_db(); import database_testing_quality; database_testing_quality.init_testing_db(); import database_integrations; print('[OK] All databases initialized successfully!')"
 
 if %errorlevel% neq 0 (
     echo X Failed to initialize databases.
